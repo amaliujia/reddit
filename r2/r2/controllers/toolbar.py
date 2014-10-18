@@ -16,24 +16,24 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
+import re
+import string
+
+from pylons import c
 
 from reddit_base import RedditController
-from r2.lib.pages import *
-from r2.models import *
-from r2.lib.pages.things import wrap_links
-from r2.lib.menus import CommentSortMenu
-from r2.lib.filters import spaceCompress, safemarkdown
-from r2.lib.memoize import memoize
-from r2.lib.template_helpers import add_sr
 from r2.lib import utils
+from r2.lib.filters import spaceCompress, safemarkdown
+from r2.lib.menus import CommentSortMenu
+from r2.lib.pages import *
+from r2.lib.pages.things import hot_links_by_url_listing, wrap_links
+from r2.lib.template_helpers import add_sr
 from r2.lib.validator import *
-from pylons import c
+from r2.models import *
 from r2.models.admintools import is_shamed_domain
-
-import string
 
 # strips /r/foo/, /s/, or both
 strip_sr          = re.compile('\A/r/[a-zA-Z0-9_-]+')
@@ -61,6 +61,16 @@ def demangle_url(path):
     path = utils.sanitize_url(path)
 
     return path
+
+def match_current_reddit_subdomain(url):
+    # due to X-Frame-Options: SAMEORIGIN headers, we can't frame mismatched
+    # reddit subdomains
+    parsed = UrlParser(url)
+    if parsed.is_reddit_url():
+        parsed.hostname = request.host
+        return parsed.unparse()
+    else:
+        return url
 
 def force_html():
     """Because we can take URIs like /s/http://.../foo.png, and we can
@@ -103,30 +113,33 @@ class ToolbarController(RedditController):
         from r2.lib.media import thumbnail_url
         if not link:
             return self.abort404()
+        elif not link.subreddit_slow.can_view(c.user):
+            # don't disclose the subreddit/title of a post via the redirect url
+            self.abort403()
         elif link.is_self:
             return self.redirect(link.url)
-        elif not (c.user_is_loggedin and c.user.pref_frame):
+        elif not (c.user_is_loggedin and c.user.uses_toolbar):
             return self.redirect(link.make_permalink_slow(force_domain=True))
         
         # if the domain is shame-banned, bail out.
         if is_shamed_domain(link.url)[0]:
             self.abort404()
-        
-        if not link.subreddit_slow.can_view(c.user):
-            self.abort403()
 
         if link.has_thumbnail:
             thumbnail = thumbnail_url(link)
         else:
             thumbnail = None
 
-        res = Frame(title = link.title,
-                    url = link.url,
-                    thumbnail = thumbnail,
-                    fullname = link._fullname)
+        res = Frame(
+            title=link.title,
+            url=match_current_reddit_subdomain(link.url),
+            thumbnail=thumbnail,
+            fullname=link._fullname,
+        )
         return spaceCompress(res.render())
 
-    def GET_s(self, rest):
+    @validate(urloid=nop('urloid'))
+    def GET_s(self, urloid):
         """/s/http://..., show a given URL with the toolbar. if it's
            submitted, redirect to /tb/$id36"""
         force_html()
@@ -140,7 +153,8 @@ class ToolbarController(RedditController):
         if is_shamed_domain(path)[0]:
             self.abort404()
 
-        link = utils.link_from_url(path, multiple = False)
+        listing = hot_links_by_url_listing(path, sr=c.site, num=1)
+        link = listing.things[0] if listing.things else None
 
         if c.cname and not c.authorized_cname:
             # In this case, we make some bad guesses caused by the
@@ -166,16 +180,12 @@ class ToolbarController(RedditController):
 
         if link:
             # we were able to find it, let's send them to the
-            # link-id-based URL so that their URL is reusable
+            # toolbar (if enabled) or comments (if not)
             return self.redirect(add_sr("/tb/" + link._id36))
-
-        title = utils.domain(path)
-        res = Frame(title = title, url = path)
-
-        # we don't want clients to think that this URL is actually a
-        # valid URL for search-indexing or the like
-        request.environ['usable_error_content'] = spaceCompress(res.render())
-        abort(404)
+        else:
+            # It hasn't been submitted yet. Give them a chance to
+            qs = utils.query_string({"url": path})
+            return self.redirect(add_sr("/submit" + qs))
 
     @validate(link = VLink('id'))
     def GET_comments(self, link):
@@ -187,16 +197,15 @@ class ToolbarController(RedditController):
         links = list(wrap_links(link))
         if not links:
             # they aren't allowed to see this link
-            return self.abort(403, 'forbidden')
+            return abort(403, 'forbidden')
         link = links[0]
 
         wrapper = make_wrapper(render_class = StarkComment,
                                target = "_top")
         b = TopCommentBuilder(link, CommentSortMenu.operator('confidence'),
-                              wrap = wrapper)
+                              num=10, wrap=wrapper)
 
-        listing = NestedListing(b, num = 10, # TODO: add config var
-                                parent_name = link._fullname)
+        listing = NestedListing(b, parent_name=link._fullname)
 
         raw_bar = strings.comments_panel_text % dict(
             fd_link=link.permalink)
@@ -214,25 +223,15 @@ class ToolbarController(RedditController):
               url = nop('url'))
     def GET_toolbar(self, link, url):
         """The visible toolbar, with voting buttons and all"""
-        if not link:
-            link = utils.link_from_url(url, multiple = False)
-
-        if link:
-            link = list(wrap_links(link, wrapper = FrameToolbar))
-        if link:
-            res = link[0]
-        elif url:
+        if url:
             url = demangle_url(url)
-            if not url:  # also check for validity
-                return self.abort404()
 
-            res = FrameToolbar(link = None,
-                               title = None,
-                               url = url,
-                               expanded = False)
+        if link:
+            wrapped = wrap_links(link, wrapper=FrameToolbar, num=1)
         else:
             return self.abort404()
-        return spaceCompress(res.render())
+
+        return spaceCompress(wrapped.render())
 
     @validate(link = VByName('id'))
     def GET_inner(self, link):
@@ -241,7 +240,11 @@ class ToolbarController(RedditController):
         if not link:
             return self.abort404()
 
-        res = InnerToolbarFrame(link = link, expanded = auto_expand_panel(link))
+        res = InnerToolbarFrame(
+            link=link,
+            url=match_current_reddit_subdomain(link.url),
+            expanded=auto_expand_panel(link),
+        )
         return spaceCompress(res.render())
 
     @validate(link = VLink('linkoid'))
@@ -249,24 +252,4 @@ class ToolbarController(RedditController):
         if not link:
             return self.abort404()
         return self.redirect(add_sr("/tb/" + link._id36))
-
-    slash_fixer = re.compile('(/s/https?:)/+')
-    @validate(urloid = nop('urloid'))
-    def GET_urloid(self, urloid):
-        # they got here from "/http://..."
-        path = demangle_url(request.fullpath)
-
-        if not path:
-            # malformed URL
-            self.abort404()
-
-        redir_path = add_sr("/s/" + path)
-        force_html()
-
-        # Redirect to http://reddit.com/s/http://google.com
-        # rather than http://reddit.com/s/http:/google.com
-        redir_path = self.slash_fixer.sub(r'\1///', redir_path, 1)
-        #                               ^^^
-        # 3=2 when it comes to self.redirect()
-        return self.redirect(redir_path)
 

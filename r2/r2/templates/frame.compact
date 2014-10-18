@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -31,7 +31,14 @@
 <html>
   <head>
     <title>${thing.title}</title>
-    ${unsafe(js.use('jquery', 'mobile'))}
+
+    <!--[if gte IE 9]> <!-->
+      ${unsafe(js.use('jquery2x', 'mobile'))}
+    <!-- <![endif]-->
+
+    <!--[if lt IE 9]>
+      ${unsafe(js.use('jquery1x', 'mobile'))}
+    <![endif]-->
     ${js_setup()}
     <link rel="stylesheet" href="${static('compact.css')}"
           type="text/css" media="screen" />
@@ -41,14 +48,12 @@
        from r2.models import Link
        from r2.lib.pages.things import wrap_links
        from r2.lib.pages import FrameToolbar
-       l = None
-       if thing.fullname:
-          l = Link._by_fullname(thing.fullname, return_dict = False)
-          l = list(wrap_links(l, wrapper = FrameToolbar))
-          l = l[0] if l else None
+       l = Link._by_fullname(thing.fullname, return_dict = False)
+       l = list(wrap_links(l, wrapper = FrameToolbar))
+       l = l[0] if l else None
      %>
     ${l}
-   <iframe border="0" class="toolbar-iframe" src="${thing.url}">
+   <iframe border="0" class="toolbar-iframe" src="${thing.url}" sandbox="allow-scripts allow-forms">
    </iframe>
   </body>
 </html>

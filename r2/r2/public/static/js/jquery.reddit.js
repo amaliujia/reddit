@@ -162,9 +162,8 @@ $.request = function(op, parameters, worker_in, block, type,
     /* 
        Uniquitous reddit AJAX poster.  Automatically addes
        handleResponse(action) worker to deal with the API result.  The
-       current subreddit (reddit.post_site), the user's modhash
-       (reddit.modhash) and whether or not we are in a frame
-       (reddit.cnameframe) are also automatically sent across.
+       current subreddit (reddit.post_site) and the user's modhash
+       (reddit.modhash) are also automatically sent across.
      */
     var action = op;
     var worker = worker_in;
@@ -176,7 +175,7 @@ $.request = function(op, parameters, worker_in, block, type,
         return
     }
 
-    if (window != window.top && !reddit.cnameframe && !reddit.external_frame) {
+    if (window != window.top && !reddit.external_frame) {
         return
     }
 
@@ -206,10 +205,6 @@ $.request = function(op, parameters, worker_in, block, type,
     /* set the subreddit name if there is one */
     if (reddit.post_site) 
         parameters.r = reddit.post_site;
-
-    /* flag whether or not we are on a cname */
-    if (reddit.cnameframe) 
-        parameters.cnameframe = 1;
 
     /* add the modhash if the user is logged in */
     if (reddit.logged) 
@@ -244,7 +239,7 @@ rate_limit = (function() {
     var default_rate_limit = 333,  // default rate-limit duration (in ms)
         rate_limits = {  // rate limit per-action (in ms, 0 = don't rate limit)
             "vote": 333,
-            "comment": 5000,
+            "comment": 333,
             "ignore": 0,
             "ban": 0,
             "unban": 0,
@@ -459,8 +454,8 @@ $.fn.replace_things = function(things, keep_children, reveal, stubs) {
      * case of a comment tree, flags whether or not the new thing has
      * the thread present) while "reveal" determines whether or not to
      * animate the transition from old to new. */
-    var self = this;
-    return $.map(things, function(thing) {
+    var self = this,
+        map = $.map(things, function(thing) {
             var data = thing.data;
             var existing = $(self).things(data.id);
             if(stubs) 
@@ -513,13 +508,15 @@ $.fn.replace_things = function(things, keep_children, reveal, stubs) {
             $(document).trigger('new_thing', new_thing)
             return new_thing;
         });
-    
+
+    $(document).trigger('new_things_inserted')
+    return map
 };
 
 
 $.insert_things = function(things, append) {
     /* Insert new things into a listing.*/
-    return $.map(things, function(thing) {
+    var map = $.map(things, function(thing) {
             var data = thing.data;
             var s = $.listing(data.parent);
             if(append)
@@ -530,7 +527,9 @@ $.insert_things = function(things, append) {
             thing_init_func(s.hide().show());
             $(document).trigger('new_thing', s)
             return s;
-        });
+        })
+    $(document).trigger('new_things_inserted')
+    return map
 };
 
 $.fn.delete_table_row = function(callback) {
@@ -553,27 +552,22 @@ $.fn.insert_table_rows = function(rows, index) {
      * the first parent of the current selection that is a table.*/
     var tables = ((this.is("table")) ? this.filter("table") : 
                   this.parents("table:first"));
-    
-    $.map(tables.get(), 
+    $.map(tables.get(),
           function(table) {
-              $.map(rows, function(thing) {
+              $.map(rows, function(row) {
                       var i = index;
-                      if(i < 0) 
+                      if(i < 0)
                           i = Math.max(table.rows.length + i + 1, 0);
                       i = Math.min(i, table.rows.length);
-                      /* create a new row and set its id and class*/
-                      var row = table.insertRow(i);
-                      $(row).hide().attr("id", thing.id)
-                          .addClass(thing.css_class);
-                      /* insert cells */
-                      $.map(thing.cells, function(cell) {
-                              $(row.insertCell(row.cells.length))
-                                  .html($.unsafe(cell))
-                                  .trigger("insert-cell");
-                          });
-                      $(row).trigger("insert-row");
-                      /* reveal! */
-                      $(row).fadeIn();
+
+                      var $newRow = $(table.insertRow(i)),
+                          $toInsert = $($.unsafe(row))
+
+                      $toInsert.hide()
+                      $newRow.replaceWith($toInsert)
+                      $toInsert.trigger("insert-row")
+                      $toInsert.css('display', 'table-row')
+                      $toInsert.fadeIn()
                   });
           });
     return this;
@@ -630,7 +624,8 @@ $.fn.insertAtCursor = function(value) {
 $.fn.select_line = function(lineNo) {
     return $(this).filter("textarea").each(function() {
             var newline = '\n', newline_length = 1, caret_pos = 0;
-            if ( $.browser.msie ) { /* IE hack */
+            var isIE = !!/msie [\w.]+/.exec( navigator.userAgent.toLowerCase() );
+            if ( isIE ) { /* IE hack */
                 newline = '\r';
                 newline_length = 0;
                 caret_pos = 1;
@@ -682,6 +677,10 @@ $.apply_stylesheet = function(cssText) {
          * that has the old stylesheet, and delete it. Then we add a
          * <style> with the new one */
         $("head").children('*[title="' + sheet_title + '"]').remove();
+
+        /* Hack to trigger a reflow so webkit browsers reset animations */
+        document.body.offsetHeight;
+
         var stylesheet = $('<style type="text/css" media="screen"></style>')
             .attr('title', sheet_title)
             .text(cssText)
@@ -698,12 +697,17 @@ $.rehighlight_new_comments = function() {
   }
 }
 
-/* namespace globals for cookies -- default prefix and domain */
+/* namespace globals for cookies -- default prefix, security and domain */
 var default_cookie_domain
 $.default_cookie_domain = function(domain) {
     if (domain) {
         default_cookie_domain = domain
     }
+}
+
+var default_cookie_security
+$.default_cookie_security = function(security) {
+    default_cookie_security = security
 }
 
 var cookie_name_prefix = "_"
@@ -720,6 +724,7 @@ $.cookie_write = function(c) {
         options.expires = c.expires
         options.domain = c.domain || default_cookie_domain
         options.path = c.path || '/'
+        options.secure = c.secure || default_cookie_security
 
         var key = cookie_name_prefix + c.name,
             value = c.data

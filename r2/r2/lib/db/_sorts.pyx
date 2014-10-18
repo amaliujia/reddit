@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -53,11 +53,17 @@ cpdef double _hot(long ups, long downs, double date):
     else:
         sign = 0
     seconds = date - 1134028003
-    return round(order + sign * seconds / 45000, 7)
+    return round(sign * order + seconds / 45000, 7)
 
 cpdef double controversy(long ups, long downs):
     """The controversy sort."""
-    return float(ups + downs) / max(abs(score(ups, downs)), 1)
+    if downs <= 0 or ups <= 0:
+        return 0
+
+    magnitude = ups + downs
+    balance = float(downs) / ups if ups > downs else float(ups) / downs
+
+    return magnitude ** balance
 
 cpdef double _confidence(int ups, int downs):
     """The confidence sort.

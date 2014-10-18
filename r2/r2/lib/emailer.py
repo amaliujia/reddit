@@ -16,11 +16,12 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from email.MIMEText import MIMEText
+from email.errors import HeaderParseError
 import datetime
 import traceback, sys, smtplib
 
@@ -30,13 +31,6 @@ from r2.lib.utils import timeago
 from r2.models import Email, DefaultSR, Account, Award
 from r2.models.token import EmailVerificationToken, PasswordResetToken
 
-
-def _feedback_email(email, body, kind, name='', reply_to = ''):
-    """Function for handling feedback and ad_inq emails.  Adds an
-    email to the mail queue to the feedback email account."""
-    Email.handler.add_to_queue(c.user if c.user_is_loggedin else None,
-                               g.feedback_email, name, email,
-                               kind, body = body, reply_to = reply_to)
 
 def _system_email(email, body, kind, reply_to = "", thing = None):
     """
@@ -55,14 +49,8 @@ def _nerds_email(body, from_name, kind):
     Email.handler.add_to_queue(None, g.nerds_email, from_name, g.nerds_email,
                                kind, body = body)
 
-def _gold_email(body, to_address, from_name, kind):
-    """
-    For sending email to reddit gold subscribers
-    """
-    Email.handler.add_to_queue(None, to_address, from_name, g.goldthanks_email,
-                               kind, body = body)
 
-def verify_email(user):
+def verify_email(user, dest=None):
     """
     For verifying an email address
     """
@@ -73,6 +61,8 @@ def verify_email(user):
 
     token = EmailVerificationToken._new(user)
     emaillink = 'http://' + g.domain + '/verification/' + token._id
+    if dest:
+        emaillink += '?dest=%s' % dest
     g.log.debug("Generated email verification link: " + emaillink)
 
     _system_email(user.email,
@@ -97,7 +87,8 @@ def password_email(user):
         raise ValueError("Somebody's beating the hell out of the password reset box")
 
     token = PasswordResetToken._new(user)
-    passlink = 'http://' + g.domain + '/resetpassword/' + token._id
+    base = g.https_endpoint or g.origin
+    passlink = base + '/resetpassword/' + token._id
     g.log.info("Generated password reset link: " + passlink)
     _system_email(user.email,
                   PasswordReset(user=user,
@@ -121,18 +112,6 @@ def email_change_email(user):
                          EmailChangeEmail(user=user).render(style='email'),
                          Email.Kind.EMAIL_CHANGE)
 
-def feedback_email(email, body, name='', reply_to = ''):
-    """Queues a feedback email to the feedback account."""
-    return _feedback_email(email, body,  Email.Kind.FEEDBACK, name = name,
-                           reply_to = reply_to)
-
-def ad_inq_email(email, body, name='', reply_to = ''):
-    """Queues a ad_inq email to the feedback account."""
-    return _feedback_email(email, body,  Email.Kind.ADVERTISE, name = name,
-                           reply_to = reply_to)
-
-def gold_email(body, to_address, from_name=g.domain):
-    return _gold_email(body, to_address, from_name, Email.Kind.GOLDMAIL)
 
 def nerds_email(body, from_name=g.domain):
     """Queues a feedback email to the nerds running this site."""
@@ -174,7 +153,7 @@ def send_queued_mail(test = False):
                 email.set_sent(rejected = False)
         # exception happens only for local recipient that doesn't exist
         except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused,
-                UnicodeDecodeError, AttributeError):
+                UnicodeDecodeError, AttributeError, HeaderParseError):
             # handle error and print, but don't stall the rest of the queue
             print "Handled error sending mail (traceback to follow)"
             traceback.print_exc(file = sys.stdout)
@@ -266,6 +245,15 @@ def live_promo(thing):
 
 def finished_promo(thing):
     return _promo_email(thing, Email.Kind.FINISHED_PROMO)
+
+
+def refunded_promo(thing):
+    return _promo_email(thing, Email.Kind.REFUNDED_PROMO)
+
+
+def void_payment(thing, campaign, reason):
+    return _promo_email(thing, Email.Kind.VOID_PAYMENT, campaign=campaign,
+                        reason=reason)
 
 
 def send_html_email(to_addr, from_addr, subject, html, subtype="html"):

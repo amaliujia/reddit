@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -26,8 +26,10 @@ import r2.lib.captcha as captcha
 from pylons import c, response
 
 from r2.controllers.api_docs import api_doc, api_section
+from r2.controllers.oauth2 import allow_oauth2_access
 
 class CaptchaController(RedditController):
+    @allow_oauth2_access
     @api_doc(api_section.captcha, uri='/captcha/{iden}')
     def GET_captchaimg(self, iden):
         """

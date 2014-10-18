@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -32,15 +32,6 @@
 
 %if thing.prev_search and thing.elapsed_time > 0:
   <div class="search-summary">
-    <%
-       label = _("about %(num)d results in %(second)s")
-       seconds = strings.float_label % \
-            dict(num=thing.elapsed_time,
-                 thing=ungettext('second', 'seconds', 2))
-     %>
-    <div class="result-count">
-      ${label % dict(num=thing.num_results, second=seconds)}
-    </div>
     %if thing.show_feedback:
     <div>
       ${_("satisfied?")}

@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -112,7 +112,9 @@
         <th>${_("start")}</th>
         <th>${_("end")}</th>
         <th>${_("target")}</th>
-        <th>${_("bid")}</th>
+        <th>${_("location")}</th>
+        <th>${_("budget")}</th>
+        <th>${_("spent")}</th>
         <th>${_("impressions")}</th>
         <th>${_("cpm")}</th>
         <th>${_("clicks")}</th>
@@ -128,7 +130,9 @@
               <td>${camp['start']}</td>
               <td>${camp['end']}</td>
               <td>${camp['target']}</td>
-              <td>${camp['bid']}</td>
+              <td title="${camp['location']}">${camp['location']}</td>
+              <td>${camp['budget']}</td>
+              <td>${camp['spent']}</td>
               <td>${camp['impressions']}</td>
               <td>${camp['cpm']}</td>
               <td>${camp['clicks']}</td>
@@ -149,8 +153,6 @@ ${unsafe(safemarkdown(strings.traffic_promoted_link_explanation))}
 %endif
 
 ${unsafe(safemarkdown(strings.traffic_help_email % dict(email=g.selfserve_support_email)))}
-
-${thing.viewer_list}
 
 ${make_campaign_table()}
 

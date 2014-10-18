@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -37,10 +37,11 @@ try:
     from r2.config import extensions
     from r2.controllers.reddit_base import RedditController, Cookies
     from r2.lib.errors import ErrorSet
-    from r2.lib.filters import websafe_json
+    from r2.lib.filters import websafe_json, websafe
     from r2.lib import log, pages
     from r2.lib.strings import rand_strings
     from r2.lib.template_helpers import static
+    from r2.lib.base import abort
     from r2.models.link import Link
     from r2.models.subreddit import DefaultSR, Subreddit
 except Exception, e:
@@ -90,6 +91,12 @@ class ErrorController(RedditController):
     This behaviour can be altered by changing the parameters to the
     ErrorDocuments middleware in your config/middleware.py file.
     """
+    # Handle POST endpoints redirecting to the error controller
+    handles_csrf = True
+
+    def check_for_bearer_token(self):
+        pass
+
     allowed_render_styles = ('html', 'xml', 'js', 'embed', '', "compact", 'api')
     # List of admins to blame (skip the first admin, "reddit")
     # If list is empty, just blame "an admin"
@@ -103,6 +110,12 @@ class ErrorController(RedditController):
             pass
         except Exception as e:
             handle_awful_failure("ErrorController.__before__: %r" % e)
+
+        # c.error_page is special-cased in a couple places to bypass
+        # c.site checks. We shouldn't allow the user to get here other
+        # than through `middleware.py:error_mapper`.
+        if not request.environ.get('pylons.error_call'):
+            abort(403, "direct access to error controller disallowed")
 
     def __after__(self): 
         try:
@@ -205,7 +218,11 @@ class ErrorController(RedditController):
         except Exception as e:
             return handle_awful_failure("ErrorController.GET_document: %r" % e)
 
-    POST_document = PUT_document = DELETE_document = GET_document
+    POST_document = GET_document
+    PUT_document = GET_document
+    PATCH_document = GET_document
+    DELETE_document = GET_document
+
 
 def handle_awful_failure(fail_text):
     """
@@ -223,7 +240,7 @@ def handle_awful_failure(fail_text):
         log.write_error_summary(fail_text)
         for line in traceback.format_exc().splitlines():
             g.log.error(line)
-        return redditbroke % (make_failien_url(), fail_text)
+        return redditbroke % (make_failien_url(), websafe(fail_text))
     except:
         # we are doomed.  Admit defeat
         return "This is an error that should never occur.  You win."

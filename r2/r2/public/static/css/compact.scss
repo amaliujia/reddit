@@ -598,6 +598,12 @@ body[orient="landscape"] > #topbar > h1 {
     overflow: hidden;
     max-height: 50px; 
 }
+
+.link .thumbnail img {
+    max-width: 50px;
+    max-height: 50px;
+}
+
 /* Entry*/
 
 .link .entry { 
@@ -887,8 +893,8 @@ padding: 5px;
 }
 
 
-/** comment gilding */
-.gilded-comment-icon {
+/** gilding */
+.gilded-icon {
     position: relative;
     display: inline-block;
     margin: 0 0 -15px 8px;
@@ -898,7 +904,7 @@ padding: 5px;
     vertical-align: middle;
 }
 
-.gilded-comment-icon:before {
+.gilded-icon:before {
     display: inline-block;
     content: '';
     background-image: url(../gold-coin.png);  /* SPRITE */
@@ -909,11 +915,11 @@ padding: 5px;
     vertical-align: -3px;
 }
 
-.user-gilded > .entry .gilded-comment-icon:before {
+.user-gilded > .entry .gilded-icon:before {
     width: 23px;
 }
 
-body.post-under-6h-old .gilded-comment-icon {
+body.post-under-6h-old .gilded-icon {
     opacity: .55;
 }
 
@@ -1140,6 +1146,15 @@ body.post-under-6h-old .gilded-comment-icon {
     color: #F01;
 }
 
+.tagline .userattrs .cakeday {
+    display: inline-block;
+    text-indent: -9999px;
+    width: 11px;
+    height: 8px;
+    background-image: url(../cake.png); /* SPRITE */
+    vertical-align: middle;
+}
+
 /*Loading spinner, yay CSS animation*/
 @-webkit-keyframes rotateThis {
   from {-webkit-transform:scale(0.75) rotate(0deg);}
@@ -1287,10 +1302,11 @@ body.toolbar {
 }
 
 .cover {
-    position: absolute;
+    position: fixed;
     left: 0px;
     top: 0px; 
     width: 100%;
+    height: 100%;
     background-color: gray;
     opacity: .3;
     z-index: 1000;

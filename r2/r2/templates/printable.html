@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,6 +24,7 @@
    from r2.lib.template_helpers import add_sr, static
    from r2.lib.strings import strings
    from r2.lib.pages.things import BanButtons
+   from r2.lib.utils import long_datetime
 %>
 
 <%namespace file="utils.html" import="plain_link" />
@@ -32,7 +33,12 @@ ${self.RenderPrintable()}
 
 <%def name="admintagline()">
   %if thing.show_spam:
-      <li><b>[
+      %if thing.banned_at:
+        <li title="${_("removed at %(time)s") % dict(time=long_datetime(thing.banned_at))}">
+      %else:
+        <li>
+      %endif
+      <b>[
         %if c.user_is_admin:
           ${"auto" if thing.autobanned else ""}${strings.banned} 
           ${("by %s" % thing.banner) if thing.banner else ""}
@@ -54,19 +60,41 @@ ${self.RenderPrintable()}
   %endif
 </%def>
 
-<%def name="thing_css_class(what)">thing id-${what._fullname}</%def>
+<%def name="gildings()">
+  % if thing.gilded_message:
+  <a href="${thing.subreddit_path}gilded">
+    <span class="gilded-icon" title="${thing.gilded_message}" data-count="${thing.gildings}">
+      % if thing.gildings > 1:
+        x${thing.gildings}
+      % endif
+    </span>
+  </a>
+  % endif
+</%def>
+
+<%def name="thing_css_class(what)">
+  <%
+    cssclass = "thing"
+    if not getattr(what, 'deleted', False) or getattr(what, 'can_ban', False):
+      cssclass += " id-" + what._fullname
+  %>
+  ${cssclass}
+</%def>
 
 <%def name="thing_css_rowclass(what)">
   <%
+    rowstyle = getattr(what, "rowstyle", "")
+
     if what.show_spam:
-      rowclass = what.rowstyle + " spam"
+      rowclass = "spam"
       if what.show_spam == "author":
         rowclass += " banned-user"
     elif what.show_reports:
-      rowclass = what.rowstyle + " reported"
+      rowclass = "reported"
     else:
-      rowclass = what.rowstyle
-    if hasattr(what, "_deleted") and what._deleted:
+      rowclass = ""
+
+    if getattr(what, "deleted", False):
       rowclass += " deleted"
     if hasattr(what, "saved") and what.saved:
       rowclass += " saved"
@@ -78,14 +106,30 @@ ${self.RenderPrintable()}
       rowclass += " user-gilded"
     if getattr(what, "stickied", False):
       rowclass += " stickied"
+    if getattr(what, "is_controversial", False) and c.user.pref_highlight_controversial:
+      rowclass += " controversial"
   %>
-  ${rowclass}
+  ${rowstyle}&#32;${rowclass}
 </%def>
 
 <%def name="thing_data_attributes(what)">
-    data-fullname="${what._fullname}"
+    % if not getattr(what, 'deleted', False):
+      data-fullname="${what._fullname}"
+    % endif
     % if hasattr(what, 'campaign'):
       data-cid="${what.campaign}"
+    % endif
+
+    % if hasattr(what, 'imp_pixel'):
+      data-imp-pixel="${what.imp_pixel}"
+    % endif
+
+    % if hasattr(what, 'adserver_imp_pixel'):
+      data-adserver-imp-pixel="${what.adserver_imp_pixel}"
+    % endif
+
+    % if hasattr(what, 'adserver_click_url'):
+      data-adserver-click-url="${what.adserver_click_url}"
     % endif
 </%def>
 
@@ -98,7 +142,9 @@ ${self.RenderPrintable()}
       cls = thing.render_class.__name__.lower()
    else:
       cls = thing.lookups[0].__class__.__name__.lower()
-   
+
+   cls += ' ' + getattr(thing, 'extra_css_class', '')
+
    if getattr(thing, "is_self", False):
       selflink = "self"
    else:
@@ -123,9 +169,9 @@ ${self.RenderPrintable()}
     ${self.entry()}
   </div>
   ${self.Child()}
-  <div class="clearleft"><!--IE6sux--></div>
+  <div class="clearleft"></div>
 </div>
-<div class="clearleft"><!--IE6sux--></div>
+<div class="clearleft"></div>
 </%def>
 
 <%def name="buttons(ban=True)">

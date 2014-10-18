@@ -16,40 +16,40 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
 <%!
+   from pylons import g
+
    from r2.lib.template_helpers import get_domain
-   from r2.lib.template_helpers import s3_https_if_secure
+   from r2.lib.template_helpers import make_url_protocol_relative
    from r2.lib.pages.things import LinkButtons
    from r2.lib.pages import WrappedUser
    from r2.lib.strings import Score, strings
 %>
  
 <%inherit  file="printable.html"/>
-<%namespace file="utils.html" import="plain_link, thing_timestamp, edited" />
+<%namespace file="utils.html" import="plain_link, thing_timestamp, edited, nsfw_stamp" />
 <%namespace file="printablebuttons.html" import="toggle_button" />
  
 <%def name="numcol()">
-  <% num = thing.num %>
-  <span class="rank" style="width:${thing.numcolmargin};">
-    %if thing.num > 0:
-      ${thing.num}
-    %endif
+  <span class="rank">
+    ${thing.num_text}
   </span>
 </%def>
 
-<%def name="make_link(name, css_class)">
-  <a class="${css_class} ${ c.user_is_loggedin and 'loggedin' or ''} ${thing.clicked and 'click' or ''}"
+<%def name="make_link(name, css_class, tabindex=0)">
+  <a class="${css_class} may-blank ${ c.user_is_loggedin and 'loggedin' or ''}"
      href="${thing.href_url}"
+     %if tabindex:
+       tabindex="${tabindex}"
+     %endif
      %if thing.nofollow:
        rel="nofollow"
      %endif
-     %if thing.newwindow:
-       target="_blank"
-     %elif c.cname:
+     %if c.cname:
        target="_top"
      %endif
      %if thing.mousedown_url:
@@ -67,9 +67,7 @@
   <ul class="flat-list buttons">
     %if thing.nsfw:
      <li class="rounded nsfw-stamp stamp">
-       <acronym title="${_('Adult content: Not Safe For Work')}">
-         ${_("NSFW")}
-       </acronym>
+      ${nsfw_stamp()}
      </li>
     %endif
     ${self.buttons()}
@@ -88,7 +86,7 @@
     %if c.site.link_flair_position == 'left':
       <%call expr="flair()" />
     %endif
-    <%call expr="make_link('title', 'title')">
+    <%call expr="make_link('title', 'title', tabindex=1)">
       ${thing.title}
     </%call>
     %if c.site.link_flair_position == 'right':
@@ -157,29 +155,20 @@
 </%def>
 
 <%def name="thing_css_class(what)" buffered="True">
-${parent.thing_css_class(what)} ${"over18" if thing.over_18 else ""}
+${parent.thing_css_class(what)} ${"over18" if thing.over_18 else ""} ${thing.visited and 'visited' or ''}
 %if c.user.pref_show_link_flair and (thing.flair_text or thing.flair_css_class):
   <% css = thing.flair_css_class or '' %>
   linkflair ${' '.join('linkflair-' + c for c in css.split())}
 %endif
 </%def>
 
-<%def name="thing_data_attributes(what)" buffered="True">
-${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${what.downvotes}"
-</%def>
-
 <%def name="subreddit()" buffered="True">
-  ${plain_link(thing.subreddit.name, thing.subreddit_path, sr_path = False,
-               cname = False, _class = "subreddit hover",
-               target='_blank' if thing.newwindow else '')}
+  ${plain_link('/r/' + thing.subreddit.name, thing.subreddit_path, sr_path = False,
+               cname = False, _class = "subreddit hover may-blank")}
 </%def>
 
 <%def name="midcol(display=True, cls = '')">
-  %if thing.pref_compress:
     <div class="midcol ${cls}"
-  %else:
-    <div class="midcol ${cls}" style="width:${thing.midcolmargin};" 
-  %endif
        ${not display and "style='display:none'" or ''}>
     ${self.arrow(thing, 1, thing.likes)}
     %if thing.pref_compress:
@@ -199,7 +188,7 @@ ${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${w
 
 <%def name="domain()">
   <span class="domain">
-    (${plain_link(thing.domain, thing.domain_path, _sr_path = False)})
+    (<a href="${thing.domain_path}">${thing.domain_str}</a>)
     %if c.user_is_admin:
       &#32;
       <a class="adminbox" href="/admin/domain/${thing.domain}">d</a>
@@ -213,12 +202,20 @@ ${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${w
   %>
   ${unsafe(taglinetext % dict(reddit=self.subreddit(),
                               score=capture(self.score, thing, thing.likes, tag='span'),
-                              when=capture(thing_timestamp, thing, thing.timesince),
+                              when=capture(thing_timestamp, thing, thing.timesince, live=True, include_tense=True),
                               author=WrappedUser(thing.author, thing.attribs, thing).render(),
                               lastedited=capture(edited, thing, thing.lastedited)
                               ))}
+  ${self.gildings()}
   %if thing.stickied:
     &#32;-&#32;<span class="stickied-tagline" title="selected by this subreddit's moderators">stickied post</span>
+  %endif
+
+  %if getattr(thing, 'savedcategory', None) is not None:
+    ${plain_link(_('category: %s') % thing.savedcategory,
+                 '/user/%s/saved/%s' % (c.user.name, thing.savedcategory),
+                 _class='save-category' + ('' if thing.savedcategory else ' hidden')
+                )}
   %endif
 </%def>
 
@@ -237,11 +234,18 @@ ${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${w
     % if not thing.thumbnail_sprited:
         <%
             if hasattr(thing, 'thumbnail_size'):
-                size_str = "width='%d' height='%d'" % (thing.thumbnail_size[0], thing.thumbnail_size[1])
+                scaling_factor = 1
+                if thing.thumbnail_size[0] > g.thumbnail_size[0]:
+                  # hidpi scaling, calculate in case hidpi changes definition in the future and
+                  # we have multiple sets of image dimensions. Currently should always be 1 or 2.
+                  # Width is always the maximum allowed, so we don't need to check height.
+                  scaling_factor = thing.thumbnail_size[0] // g.thumbnail_size[0]
+
+                size_str = "width='%d' height='%d'" % (thing.thumbnail_size[0] // scaling_factor, thing.thumbnail_size[1] // scaling_factor)
             else:
                 size_str = ""
         %>
-        <img src="${s3_https_if_secure(thing.thumbnail)}" ${size_str} alt=""/>
+        <img src="${make_url_protocol_relative(thing.thumbnail)}" ${size_str} alt="">
     % endif
   </%call>
   %endif

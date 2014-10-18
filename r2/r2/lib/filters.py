@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -239,15 +239,22 @@ def safemarkdown(text, nofollow=False, wrap=True, **kwargs):
         return SC_OFF + text + SC_ON
 
 def wikimarkdown(text, include_toc=True, target=None):
-    from r2.lib.cssfilter import legacy_s3_url
+    from r2.lib.template_helpers import media_https_if_secure
+
+    # this hard codes the stylesheet page for now, but should be parameterized
+    # in the future to allow per-page images.
+    from r2.models.wiki import ImagesByWikiPage
+    from r2.lib.utils import UrlParser
+    from r2.lib.template_helpers import add_sr
+    page_images = ImagesByWikiPage.get_images(c.site, "config/stylesheet")
     
     def img_swap(tag):
         name = tag.get('src')
         name = custom_img_url.search(name)
         name = name and name.group(1)
-        if name and c.site.images.has_key(name):
-            url = c.site.images[name]
-            url = legacy_s3_url(url, c.site)
+        if name and name in page_images:
+            url = page_images[name]
+            url = media_https_if_secure(url)
             tag['src'] = url
         else:
             tag.extract()
@@ -263,7 +270,16 @@ def wikimarkdown(text, include_toc=True, target=None):
     
     if images:
         [img_swap(image) for image in images]
-    
+
+    def add_ext_to_link(link):
+        url = UrlParser(link.get('href'))
+        if url.is_reddit_url():
+            link['href'] = add_sr(link.get('href'), sr_path=False)
+
+    if c.render_style == 'compact':
+        links = soup.findAll('a')
+        [add_ext_to_link(a) for a in links]
+
     if include_toc:
         tocdiv = generate_table_of_contents(soup, prefix="wiki")
         if tocdiv:
@@ -319,7 +335,9 @@ def generate_table_of_contents(soup, prefix):
         if previous and thislevel > previous:
             newul = Tag(soup, "ul")
             newul.level = thislevel
-            parent.append(newul)
+            newli = Tag(soup, "li", [("class", "toc_child")])
+            newli.append(newul)
+            parent.append(newli)
             parent = newul
             level += 1
         elif level and thislevel < previous:

@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -103,7 +103,7 @@ ${self.Child()}
 <%def name="arrows(thing)">
   %if getattr(thing, 'embed_voting_style',None) == 'votable':
     ${self.real_arrows(thing)}
-  %elif request.get.get("expanded") or getattr(thing, 'embed_voting_style',None) == 'expanded':
+  %elif request.GET.get("expanded") or getattr(thing, 'embed_voting_style', None) == 'expanded':
     ${self.iframe_arrows(thing)}
   %else:
     ${self.static_arrows(thing)}

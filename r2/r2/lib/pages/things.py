@@ -16,13 +16,14 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
+from r2.lib.db.thing import NotFound
 from r2.lib.menus import Styled
 from r2.lib.wrapped import Wrapped
-from r2.models import LinkListing, Link, PromotedLink
+from r2.models import LinkListing, Link, PromotedLink, Report
 from r2.models import make_wrapper, IDBuilder, Thing
 from r2.lib.utils import tup
 from r2.lib.strings import Score
@@ -32,11 +33,14 @@ from pylons import c, g
 from pylons.i18n import _, ungettext
 
 class PrintableButtons(Styled):
+    cachable = False
+
     def __init__(self, style, thing,
                  show_delete = False, show_report = True,
                  show_distinguish = False, show_marknsfw = False,
                  show_unmarknsfw = False, is_link=False,
-                 show_flair = False, **kw):
+                 show_flair=False, show_rescrape=False,
+                 show_givegold=False, **kw):
         show_ignore = thing.show_reports
         approval_checkmark = getattr(thing, "approval_checkmark", None)
         show_approve = (thing.show_spam or show_ignore or
@@ -57,6 +61,8 @@ class PrintableButtons(Styled):
                         show_marknsfw = show_marknsfw,
                         show_unmarknsfw = show_unmarknsfw,
                         show_flair = show_flair,
+                        show_rescrape=show_rescrape,
+                        show_givegold=show_givegold,
                         **kw)
         
 class BanButtons(PrintableButtons):
@@ -70,22 +76,20 @@ class LinkButtons(PrintableButtons):
         is_author = (c.user_is_loggedin and thing.author and
                      c.user.name == thing.author.name)
         # do we show the report button?
-        show_report = (not is_author and
-                       report and
-                       getattr(thing, "promoted", None) is None)
+        show_report = not is_author and report
 
-        if c.user_is_admin and thing.promoted is None:
-            show_report = False
+        show_marknsfw = show_unmarknsfw = False
+        show_rescrape = False
+        if thing.can_ban or is_author or (thing.promoted and c.user_is_sponsor):
+            if not thing.nsfw:
+                show_marknsfw = True
+            elif thing.nsfw and not thing.nsfw_str:
+                show_unmarknsfw = True
 
-        if (thing.can_ban or is_author) and not thing.nsfw:
-            show_marknsfw = True
-        else:
-            show_marknsfw = False
-
-        if (thing.can_ban or is_author) and thing.nsfw and not thing.nsfw_str:
-            show_unmarknsfw = True
-        else:
-            show_unmarknsfw = False
+            if (not thing.is_self and
+                    not (thing.has_thumbnail or thing.media_object)):
+                show_rescrape = True
+        show_givegold = thing.can_gild and (c.permalink_page or c.profilepage)
 
         # do we show the delete button?
         show_delete = is_author and delete and not thing._deleted
@@ -96,7 +100,10 @@ class LinkButtons(PrintableButtons):
         # do we show the distinguish button? among other things,
         # we never want it to appear on link listings -- only
         # comments pages
-        show_distinguish = (is_author and (thing.can_ban or c.user_special_distinguish)
+        show_distinguish = (is_author and
+                            (thing.can_ban or  # Moderator distinguish
+                             c.user.employee or  # Admin distinguish
+                             c.user_special_distinguish)
                             and getattr(thing, "expand_children", False))
 
         kw = {}
@@ -111,7 +118,6 @@ class LinkButtons(PrintableButtons):
         PrintableButtons.__init__(self, 'linkbuttons', thing, 
                                   # user existence and preferences
                                   is_loggedin = c.user_is_loggedin,
-                                  new_window = c.user.pref_newwindow,
                                   # comment link params
                                   comment_label = thing.comment_label,
                                   commentcls = thing.commentcls,
@@ -123,10 +129,14 @@ class LinkButtons(PrintableButtons):
                                   ignore_reports = thing.ignore_reports,
                                   show_delete = show_delete,
                                   show_report = show_report and c.user_is_loggedin,
+                                  mod_reports=thing.mod_reports,
+                                  user_reports=thing.user_reports,
                                   show_distinguish = show_distinguish,
                                   show_marknsfw = show_marknsfw,
                                   show_unmarknsfw = show_unmarknsfw,
                                   show_flair = thing.can_flair,
+                                  show_rescrape=show_rescrape,
+                                  show_givegold=show_givegold,
                                   show_comments = comments,
                                   # promotion
                                   promoted = thing.promoted,
@@ -142,41 +152,32 @@ class CommentButtons(PrintableButtons):
         # do we show the delete button?
         show_delete = is_author and delete and not thing._deleted
 
-        can_gild = (
-            # you can't gild your own comment
-            not is_author
-            # no point in showing the button for things you've already gilded
-            and not thing.user_gilded
-            # this is a way of checking if the user is logged in that works
-            # both within CommentPane instances and without.  e.g. CommentPane
-            # explicitly sets user_is_loggedin = False but can_reply is
-            # correct.  while on user overviews, you can't reply but will get
-            # the correct value for user_is_loggedin
-            and (c.user_is_loggedin or thing.can_reply)
-            # ick, if the author deleted their account we shouldn't waste gold
-            and not thing.author._deleted
-            # some subreddits can have gilding disabled
-            and thing.subreddit.allow_comment_gilding
-        )
+        show_distinguish = (is_author and
+                            (thing.can_ban or  # Moderator distinguish
+                             c.user.employee or  # Admin distinguish
+                             c.user_special_distinguish))
 
-        show_distinguish = is_author and (thing.can_ban or c.user_special_distinguish)
+        show_givegold = thing.can_gild
 
         PrintableButtons.__init__(self, "commentbuttons", thing,
+                                  can_save=thing.can_save,
                                   is_author = is_author, 
                                   profilepage = c.profilepage,
                                   permalink = thing.permalink,
                                   saved = thing.saved,
                                   ignore_reports = thing.ignore_reports,
-                                  new_window = c.user.pref_newwindow,
                                   full_comment_path = thing.full_comment_path,
                                   full_comment_count = thing.full_comment_count,
                                   deleted = thing.deleted,
                                   parent_permalink = thing.parent_permalink, 
                                   can_reply = thing.can_reply,
-                                  can_gild=can_gild,
                                   show_report = show_report,
+                                  mod_reports=thing.mod_reports,
+                                  user_reports=thing.user_reports,
                                   show_distinguish = show_distinguish,
-                                  show_delete = show_delete)
+                                  show_delete = show_delete,
+                                  show_givegold=show_givegold,
+        )
 
 class MessageButtons(PrintableButtons):
     def __init__(self, thing, delete = False, report = True):
@@ -208,9 +209,9 @@ def default_thing_wrapper(**params):
         if isinstance(thing, Link):
             if thing.promoted is not None:
                 w.render_class = PromotedLink
-                w.rowstyle = 'promoted link'
             elif style == 'htmllite':
                 w.score_fmt = Score.points
+            w.should_incr_counts = style != 'htmllite'
         return w
     params['parent_wrapper'] = _default_thing_wrapper
     return make_wrapper(**params)
@@ -218,18 +219,24 @@ def default_thing_wrapper(**params):
 # TODO: move this into lib somewhere?
 def wrap_links(links, wrapper = default_thing_wrapper(),
                listing_cls = LinkListing, 
-               num = None, show_nums = False, nextprev = False,
-               num_margin = None, mid_margin = None, **kw):
+               num = None, show_nums = False, nextprev = False, **kw):
     links = tup(links)
     if not all(isinstance(x, basestring) for x in links):
         links = [x._fullname for x in links]
     b = IDBuilder(links, num = num, wrap = wrapper, **kw)
     l = listing_cls(b, nextprev = nextprev, show_nums = show_nums)
-    if num_margin is not None:
-        l.num_margin = num_margin
-    if mid_margin is not None:
-        l.mid_margin = mid_margin
     return l.listing()
+
+
+def hot_links_by_url_listing(url, sr=None, num=None, **kw):
+    try:
+        links_for_url = Link._by_url(url, sr)
+    except NotFound:
+        links_for_url = []
+
+    links_for_url.sort(key=lambda link: link._hot, reverse=True)
+    listing = wrap_links(links_for_url, num=num, **kw)
+    return listing
 
 
 def wrap_things(*things):

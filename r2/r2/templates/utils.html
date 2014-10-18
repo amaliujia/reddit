@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,8 +24,8 @@
    import json
    from r2.models import FakeSubreddit
    from r2.lib.filters import spaceCompress, unsafe, safemarkdown
-   from r2.lib.template_helpers import add_sr, js_config, static, html_datetime
-   from r2.lib.utils import cols, long_datetime, timesince
+   from r2.lib.template_helpers import add_sr, js_config, static, html_datetime, simplified_timesince
+   from r2.lib.utils import cols, long_datetime
    from r2.lib import tracking
    from datetime import datetime
 %>
@@ -217,51 +217,12 @@ ${unsafe(txt)}
 %endif
 </%def>
 
-<%def name="language_checkboxes(default = 'all')">
-<%
-   all_checked, some_checked = "checked='checked'", "" 
-   if default != "all":
-     all_checked, some_checked = some_checked, all_checked
-%>
-<input type="radio" name="all-langs" id="all-langs" value="all"
-       onclick="clear_all_langs(this)" ${all_checked}/>
-<label for="all-langs">${_("all languages")}</label>
-<br/>
-<input type="radio" name="all-langs" id="some-langs" value="some"
-       ${some_checked}/>
-<label for="some-langs">${_("some languages")}</label>
-<hr/>
-<table>
-<%
-   all_langs = [x for x in g.all_languages if len(x) == 2]
- %>
-%for col in cols(all_langs, 3):
-  <tr>
-  %for lang in col:
-    <td style="padding-right: 15px; white-space: nowrap;">
-    <%
-       idname = "lang-" + lang
-       if default != "all" and lang in default:
-         checked = "checked='checked'"
-       else:
-         checked = ""
-    %>
-    <input type="checkbox" name="${idname}" id="${idname}"
-           onclick="check_some_langs(this)" ${checked}/>
-    <label for="${idname}">${g.lang_name[lang][0]}</label>
-    </td>
-  %endfor
-  </tr>
-%endfor
-</table>
-</%def>
-
 <%def name="separator(separator_char)">
   <span class="separator">${separator_char}</span>
 </%def>
 
 <%def name="optionalstyle(style)">
-  %if request.get.get('style') != "off":
+  %if request.GET.get('style') != "off":
     style="${style}"
   %endif
 </%def>
@@ -337,11 +298,11 @@ ${unsafe(txt)}
             <br/>
           %endif
           <input type="file" name="file" id="file" 
-                 onchange="$(this).next().show(); ${onchange}"/>
-          <button id="submit-img" class="submit-img"
+                 onchange="$(this).next().prop('disabled', false); ${onchange}"/>
+          <button id="submit-img" class="submit-img primary-button"
                   type="submit" name="upload" 
                   onclick="$(this).siblings('.img-status').show().html('${_('uploading')}'); return true;"
-                  style="display: none;" >
+                  disabled>
             ${_('upload')}
           </button>
 
@@ -374,7 +335,6 @@ ${unsafe(txt)}
                   img.attr("src", "").attr("src", img_src);
               img.show().parent().show();
               form.find(".delete-img").show();
-              form.find(".submit-img").hide();
               on_image_success(img);
           }
        }
@@ -423,12 +383,14 @@ ${unsafe(txt)}
   %if g.googleanalytics and thing.site_tracking:
   <script type="text/javascript">
 
+    var user_type = '${"guest" if not c.user_is_loggedin else "goldloggedin" if c.user.gold else "loggedin"}';
     var _gaq = _gaq || [];
     _gaq.push(
         ['_setAccount', '${g.googleanalytics}'],
+        ['_setDomainName', '${g.domain}'],
         ['_setCustomVar', 1, 'site', '${tracking.get_site()}', 3],
         ['_setCustomVar', 2, 'srpath', '${tracking.get_srpath()}', 3],
-        ['_setCustomVar', 3, 'usertype', '${"loggedin" if c.user_is_loggedin else "guest"}', 2],
+        ['_setCustomVar', 3, 'usertype', user_type, 2],
         ['_setCustomVar', 4, 'uitype', '${uitype}', 3],
         ['_trackPageview']
     );
@@ -529,18 +491,36 @@ ${unsafe(txt)}
   </tr>
 </%def>
 
-<%def name="timestamp(date, since=None)">
+<%def name="inline_radio_type(field_name, val_name, text=None, checked=False)">
+	<% full_name = field_name + "_" + val_name %>
+	<label>
+	<input class="nomargin" type="radio" name="${field_name}"
+		id="${full_name}" value="${val_name}"
+		%if checked:
+			checked="checked"
+		%endif
+	>
+	%if text:
+		${text}
+	%endif
+	</label>
+</%def>
+
+<%def name="timestamp(date, since=None, live=False, include_tense=False)">
   ## todo: use pubdate attribute once things are <article> tags.
   ## note: comment and link templates will pass a CachedVariable stub as since.
-  <time title="${long_datetime(date)}" datetime="${html_datetime(date)}">
-    ${unsafe(since or timesince(date))}
+  <%
+    timestamp_class = unsafe(' class="live-timestamp"') if live else ''
+  %>
+  <time title="${long_datetime(date)}" datetime="${html_datetime(date)}"${timestamp_class}>
+    ${unsafe(since or simplified_timesince(date, include_tense))}
   </time>
 </%def>
 
-<%def name="thing_timestamp(thing, since=None)">
+<%def name="thing_timestamp(thing, since=None, live=False, include_tense=False)">
   ## todo: use pubdate attribute once things are <article> tags.
   ## note: comment and link templates will pass a CachedVariable stub as since.
-  ${timestamp(thing._date, since=since)}
+  ${timestamp(thing._date, since=since, live=live, include_tense=include_tense)}
 </%def>
 
 <%def name="percentage(slice, total)">
@@ -567,16 +547,26 @@ ${unsafe(txt)}
 
 <%def name="edited(thing, lastedited=None)">
   %if isinstance(thing.editted, datetime):
-    <time class="edited-timestamp" title="${_('last edited')} ${unsafe(lastedited or timesince(thing.editted))} ${_('ago')}" datetime="${html_datetime(thing.editted)}">*</time>
+    <time class="edited-timestamp" title="${_('last edited')} ${unsafe(lastedited or simplified_timesince(thing.editted))}" datetime="${html_datetime(thing.editted)}">*</time>
   %elif thing.editted:
     <em>*</em>
   %endif
 </%def>
 
-<%def name="md(text, wrap=False)">
-  ${unsafe(safemarkdown(text, wrap=wrap))}
+<%def name="md(text, wrap=False, **kwargs)">
+  ${unsafe(safemarkdown(text, wrap=wrap, **kwargs))}
 </%def>
 
 <%def name="_md(text, wrap=False)">
   ${md(_(text), wrap=wrap)}
+</%def>
+
+<%def name="_mdf(text, wrap=False, **kwargs)">
+  ${md(_(text) % kwargs, wrap=wrap)}
+</%def>
+
+<%def name="nsfw_stamp()">
+  <acronym title="${_('Adult content: Not Safe For Work')}">
+    ${_("NSFW")}
+  </acronym>
 </%def>

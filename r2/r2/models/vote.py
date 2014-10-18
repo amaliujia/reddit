@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -124,13 +124,17 @@ class VoteDetailsByThing(tdb_cassandra.View):
             raise ValueError
 
         try:
-            raw_details = details_cls._byID(thing._id36)._values()
+            raw_details = details_cls._byID(thing._id36)
+            return raw_details.decode_details()
         except tdb_cassandra.NotFound:
-            raw_details = {}
+            return []
+
+    def decode_details(self):
+        raw_details = self._values()
         details = []
         for key, value in raw_details.iteritems():
             data = Storage(json.loads(value))
-            data["_id"] = key + "_" + thing._id36
+            data["_id"] = key + "_" + self._id
             data["voter_id"] = key
             details.append(data)
         details.sort(key=lambda d: d["date"])
@@ -150,8 +154,6 @@ class VoteDetailsByComment(VoteDetailsByThing):
 class Vote(MultiRelation('vote',
                          Relation(Account, Link),
                          Relation(Account, Comment))):
-    _defaults = {'organic': False}
-
     @classmethod
     def vote(cls, sub, obj, dir, ip, vote_info = None, cheater = False,
              timer=None, date=None):
@@ -183,12 +185,17 @@ class Vote(MultiRelation('vote',
         if len(oldvote):
             v = oldvote[0]
             oldamount = int(v._name)
+            if amount == oldamount:
+                return v
+
             v._name = str(amount)
 
             #these still need to be recalculated
             old_valid_thing = getattr(v, 'valid_thing', False)
-            v.valid_thing = (valid_thing(v, karma, cheater = cheater)
-                             and getattr(v,'valid_thing', False))
+            v.valid_thing = (old_valid_thing and
+                             valid_thing(
+                                v, karma, cheater=cheater, vote_info=vote_info)
+                            )
             v.valid_user = (getattr(v, 'valid_user', False)
                             and v.valid_thing
                             and valid_user(v, sr, karma))
@@ -198,7 +205,9 @@ class Vote(MultiRelation('vote',
             oldamount = 0
             v = rel(sub, obj, str(amount), date=date)
             v.ip = ip
-            old_valid_thing = v.valid_thing = valid_thing(v, karma, cheater = cheater)
+            v.valid_thing = valid_thing(
+                                v, karma, cheater=cheater, vote_info=vote_info)
+            old_valid_thing = v.valid_thing
             v.valid_user = (v.valid_thing and valid_user(v, sr, karma)
                             and not is_self_link)
 

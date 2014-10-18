@@ -16,12 +16,12 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
 <%!
-  from r2.lib.template_helpers import static
+  from r2.lib.template_helpers import static, make_url_protocol_relative
   from r2.lib.utils import timeuntil
 %>
 
@@ -32,7 +32,7 @@
 <%def name="icon(app)">
   <div class="app-icon">
     &nbsp;
-    <img src="${app.icon_url or static('defaultapp.png')}">
+    <img src="${make_url_protocol_relative(app.icon_url) or static('defaultapp.png')}">
     &nbsp;
   </div>
 </%def>
@@ -54,6 +54,18 @@
       %endfor
     </div>
   %endif
+</%def>
+
+<%def name="app_type_selector(selection='web')">
+${utils.radio_type('app_type', "web", _("web app"),
+                   _("A web based application"),
+                   selection == "web")}
+${utils.radio_type('app_type', "installed", _("installed app"),
+                   _("An app intended for installation, such as on a mobile phone"),
+                   selection == "installed")}
+${utils.radio_type('app_type', "script", _("script"),
+                   _("Script for personal use. Will only have access to the developers accounts"),
+                   selection == "script")}
 </%def>
 
 <%def name="editable_developer(app, dev)">
@@ -83,6 +95,15 @@
         ${app.name}
       %endif
       </h2>
+      <h3>
+        %if app.app_type == 'web':
+          ${_("web app")}
+        %elif app.app_type == 'installed':
+          ${_("installed app")}
+        %elif app.app_type == 'script':
+          ${_("personal use script")}
+        %endif
+      </h3>
       <h3>${app._id}</h3>
     </div>
     <div class="app-description">${app.description}</div>
@@ -90,25 +111,22 @@
       ${developers(app)}
     %endif
     <div class="edit-app ${'collapsed' if collapsed else ''}">
-      <% from r2.lib import media %>
-      %if media.can_upload_icon():
-        <a class="edit-app-icon-button" href="javascript:void(0)">
-          change icon
-        </a>
-        <%utils:ajax_upload target="/api/setappicon"
-                            form_id="app-icon-upload-${app._id}">
-          <input type="hidden" name="client_id" value="${app._id}" />
-          ${error_field('NOT_SUPPORTED', '')}
-          ${error_field('TOO_LONG', 'file')}
-          ${error_field('BAD_IMAGE', 'file')}
-        </%utils:ajax_upload>
-      %endif
+      <a class="edit-app-icon-button" href="javascript:void(0)">
+        change icon
+      </a>
+      <%utils:ajax_upload target="/api/setappicon"
+                          form_id="app-icon-upload-${app._id}">
+        <input type="hidden" name="client_id" value="${app._id}" />
+        ${error_field('TOO_LONG', 'file')}
+        ${error_field('BAD_IMAGE', 'file')}
+      </%utils:ajax_upload>
       <div class="edit-app-form">
         <form method="post" action="/api/updateapp" class="pretty-form"
          id="update-app-${app._id}"
          onsubmit="${"return post_form(this, 'updateapp', function(x) {return '%s'})" % _("updating...")}">
           <input type="hidden" name="uh" value="${c.modhash}" />
           <input type="hidden" name="client_id" value="${app._id}" />
+          <input type="hidden" name="app_type" value="${app.app_type}" />
           <table class="preftable">
             <tr>
               <th>${_("secret")}</th>
@@ -117,7 +135,7 @@
             <tr>
               <th>${_("name")}</th>
               <td class="prefright">
-                <input name="name" value="${app.name}">
+                <input class="text" name="name" value="${app.name}">
                 ${error_field("NO_TEXT", "name")}
               </td>
             </tr>
@@ -130,17 +148,18 @@
             <tr>
               <th>${_("about url")}</th>
               <td class="prefright">
-                <input name="about_url" value="${app.about_url}">
+                <input class="text" name="about_url" value="${app.about_url}">
                 ${error_field("BAD_URL", "about_url")}
               </td>
             </tr>
             <tr>
               <th>${_("redirect uri")}</th>
               <td class="prefright">
-                <input name="redirect_uri"
-                 value="${app.redirect_uri}">
+                <input class="text" name="redirect_uri"
+                 value="${app.redirect_uri if app.redirect_uri else ''}">
                 ${error_field("NO_URL", "redirect_uri")}
                 ${error_field("BAD_URL", "redirect_uri")}
+                ${error_field("INVALID_SCHEME", "redirect_uri")}
               </td>
             </tr>
           </table>
@@ -164,7 +183,7 @@
                onsubmit="${"return post_form(this, 'adddeveloper', function(x) {return '%s'})" % _("adding...")}">
                 <input type="hidden" name="uh" value="${c.modhash}" />
                 <input type="hidden" name="client_id" value="${app._id}" />
-                ${_('add developer')}: <input name="name">
+                ${_('add developer')}: <input class="text" name="name">
                 <br>
                 ${error_field('TOO_MANY_DEVELOPERS', '')}
                 ${error_field('OAUTH2_INVALID_CLIENT', 'client_id')}
@@ -200,11 +219,17 @@
 <%def name="scope_details(scope, compact=False, expiration=None)">
   <div class="app-permissions">
     <ul>
-      %if not compact and scope.subreddit_only:
-        <li>
-          ${_("Only in the subreddits:")}&#32;
-          ${sr_list(scope.subreddits)}.
-        </li>
+      %if scope.subreddit_only:
+        %if compact:
+	  ${_("Only in:")}&#32;
+	  ${sr_list(scope.subreddits)}
+	  <br>
+	%else:
+          <li>
+            ${_("Only in the subreddits:")}&#32;
+            ${sr_list(scope.subreddits)}.
+          </li>
+	%endif
       %endif
       %for name, scope_info in scope.details():
         <li>
@@ -228,43 +253,39 @@
         </li>
       %endif
     </ul>
-    %if compact and (scope.subreddit_only or expiration):
+    %if compact and expiration:
       <div class="app-permissions-details">
-      %if scope.subreddit_only:
-        ${_("Only in:")}&#32;
-        ${sr_list(scope.subreddits)}
-        <br>
-      %endif
-      %if expiration:
         ${_("Expires in:")}&#32;
         ${timeuntil(expiration)}
         <br>
-      %endif
       </div>
     %endif
   </div>
 </%def>
 
-<%def name="authorized_app(app, scope, expiration)">
-  <div id="authorized-app-${app._id}" class="authorized-app rounded">
-    ${icon(app)}
+<%def name="authorized_app(app_data)">
+  <div id="authorized-app-${app_data['client']._id}" class="authorized-app rounded">
+    ${icon(app_data['client'])}
     <div class="app-details">
       <h2>
-      %if app.about_url:
-        <a href="${app.about_url}">${app.name}</a>
+      %if app_data['client'].about_url:
+        <a href="${app_data['client'].about_url}">${app_data['client'].name}</a>
       %else:
-        ${app.name}
+        ${app_data['client'].name}
       %endif
       </h2>
-      ${scope_details(scope, compact=True, expiration=expiration)}
+      ## `sorted` should put global permissions first (keyed off `None`)
+      %for sr in sorted(app_data['scopes']):
+        ${scope_details(app_data['scopes'][sr], compact=True)}<br>
+      %endfor
     </div>
-    <div class="app-description">${app.description}</div>
-    ${developers(app)}
+    <div class="app-description">${app_data['client'].description}</div>
+    ${developers(app_data['client'])}
     ${ynbutton(_("revoke access"),
                _("revoked"),
                "revokeapp",
                callback="r.apps.revoked",
-               hidden_data=dict(client_id=app._id),
+               hidden_data=dict(client_id=app_data['client']._id),
                _class="revoke-app-button")}
   </div>
 </%def>
@@ -272,8 +293,8 @@
 %if thing.my_apps:
   <h1>${_("authorized applications")}</h1>
 
-  %for app, scope, expiration in thing.my_apps:
-    ${authorized_app(app, scope, expiration)}
+  %for app_data in thing.my_apps.values():
+    ${authorized_app(app_data)}
   %endfor
 %endif
 
@@ -304,10 +325,11 @@
       <tr>
         <th>${_("name")}</th>
         <td class="prefright">
-          <input name="name">
+          <input class="text" name="name">
           ${error_field("NO_TEXT", "name")}
         </td>
       </tr>
+      ${app_type_selector()}
       <tr>
         <th>${_("description")}</th>
         <td class="prefright">
@@ -317,16 +339,17 @@
       <tr>
         <th>${_("about url")}</th>
         <td class="prefright">
-          <input name="about_url">
+          <input class="text" name="about_url">
           ${error_field("BAD_URL", "about_url")}
         </td>
       </tr>
       <tr>
         <th>${_("redirect uri")}</th>
         <td class="prefright">
-          <input name="redirect_uri">
+          <input class="text" name="redirect_uri">
           ${error_field("NO_URL", "redirect_uri")}
           ${error_field("BAD_URL", "redirect_uri")}
+          ${error_field("INVALID_SCHEME", "redirect_uri")}
         </td>
       </tr>
     </table>

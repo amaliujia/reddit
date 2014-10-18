@@ -16,35 +16,41 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
+from r2.config import feature
 from r2.lib.db.thing     import Thing, Relation, NotFound
 from r2.lib.db.operators import lower
 from r2.lib.db.userrel   import UserRel
 from r2.lib.db           import tdb_cassandra
 from r2.lib.memoize      import memoize
-from r2.lib.utils        import modhash, valid_hash, randstr, timefromnow
+from r2.lib.admin_utils  import modhash, valid_hash
+from r2.lib.utils        import randstr, timefromnow
 from r2.lib.utils        import UrlParser
 from r2.lib.utils        import constant_time_compare, canonicalize_email
 from r2.lib.cache        import sgm
-from r2.lib import filters
+from r2.lib import filters, hooks
 from r2.lib.log import log_text
 from r2.models.last_modified import LastModified
+from r2.models.trylater import TryLater
 
 from pylons import c, g, request
 from pylons.i18n import _
 import time
 import hashlib
+from collections import Counter, OrderedDict
 from copy import copy
 from datetime import datetime, timedelta
 import bcrypt
 import hmac
 import hashlib
+import itertools
 from pycassa.system_manager import ASCII_TYPE
 
 
+trylater_hooks = hooks.HookRegistrar()
 COOKIE_TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S'
 
 
@@ -54,7 +60,9 @@ class Account(Thing):
     _data_int_props = Thing._data_int_props + ('link_karma', 'comment_karma',
                                                'report_made', 'report_correct',
                                                'report_ignored', 'spammer',
-                                               'reported', 'gold_creddits', )
+                                               'reported', 'gold_creddits',
+                                               'inbox_count',
+                                              )
     _int_prop_suffix = '_karma'
     _essentials = ('name', )
     _defaults = dict(pref_numsites = 25,
@@ -62,6 +70,7 @@ class Account(Thing):
                      pref_frame_commentspanel = False,
                      pref_newwindow = False,
                      pref_clickgadget = 5,
+                     pref_store_visits = False,
                      pref_public_votes = False,
                      pref_hide_from_robots = False,
                      pref_research = False,
@@ -70,10 +79,12 @@ class Account(Thing):
                      pref_min_link_score = -4,
                      pref_min_comment_score = -4,
                      pref_num_comments = g.num_comments,
+                     pref_highlight_controversial=False,
                      pref_lang = g.lang,
                      pref_content_langs = (g.lang,),
                      pref_over_18 = False,
                      pref_compress = False,
+                     pref_domain_details = False,
                      pref_organic = True,
                      pref_no_profanity = True,
                      pref_label_nsfw = True,
@@ -85,14 +96,17 @@ class Account(Thing):
                      pref_collapse_read_messages = False,
                      pref_private_feeds = True,
                      pref_local_js = False,
+                     pref_force_https = False,
                      pref_show_adbox = True,
                      pref_show_sponsors = True, # sponsored links
                      pref_show_sponsorships = True,
+                     pref_show_trending=True,
                      pref_highlight_new_comments = True,
                      pref_monitor_mentions=True,
+                     pref_collapse_left_bar=False,
+                     pref_public_server_seconds=False,
                      mobile_compress = False,
                      mobile_thumbnail = True,
-                     trusted_sponsor = False,
                      reported = 0,
                      report_made = 0,
                      report_correct = 0,
@@ -110,10 +124,22 @@ class Account(Thing):
                      gold = False,
                      gold_charter = False,
                      gold_creddits = 0,
-                     gold_creddit_escrow = 0,
+                     cake_expiration=None,
                      otp_secret=None,
                      state=0,
+                     modmsgtime=None,
+                     inbox_count=0,
+                     banned_profile_visible=False,
+                     pref_use_global_defaults=False,
+                     pref_hide_locationbar=False,
+                     pref_creddit_autorenew=False,
+                     update_sent_messages=True,
                      )
+    _preference_attrs = tuple(k for k in _defaults.keys()
+                              if k.startswith("pref_"))
+
+    def preferences(self):
+        return {pref: getattr(self, pref) for pref in self._preference_attrs}
 
     def __eq__(self, other):
         if type(self) != type(other):
@@ -178,38 +204,45 @@ class Account(Thing):
     def comment_karma(self):
         return self.karma('comment')
 
-    @property
-    def safe_karma(self):
-        karma = self.link_karma
-        return max(karma, 1) if karma > -1000 else karma
+    def all_karmas(self, include_old=True):
+        """Get all of the user's subreddit-specific karma totals.
 
-    def all_karmas(self):
-        """returns a list of tuples in the form (name, hover-text, link_karma,
-        comment_karma)"""
+        Returns an OrderedDict keyed on subreddit name and containing
+        (link_karma, comment_karma) tuples, ordered by the combined total
+        descending.
+        """
         link_suffix = '_link_karma'
         comment_suffix = '_comment_karma'
-        karmas = []
-        sr_names = set()
-        for k in self._t.keys():
-            if k.endswith(link_suffix):
-                sr_names.add(k[:-len(link_suffix)])
-            elif k.endswith(comment_suffix):
-                sr_names.add(k[:-len(comment_suffix)])
-        for sr_name in sr_names:
-            karmas.append((sr_name, None,
-                           self._t.get(sr_name + link_suffix, 0),
-                           self._t.get(sr_name + comment_suffix, 0)))
 
-        karmas.sort(key = lambda x: x[2] + x[3], reverse=True)
+        comment_karmas = Counter()
+        link_karmas = Counter()
+        combined_karmas = Counter()
 
-        old_link_karma = self._t.get('link_karma', 0)
-        old_comment_karma = self._t.get('comment_karma', 0)
-        if old_link_karma or old_comment_karma:
-            karmas.append((_('ancient history'),
-                           _('really obscure karma from before it was cool to track per-subreddit'),
-                           old_link_karma, old_comment_karma))
+        for key, value in self._t.iteritems():
+            if key.endswith(link_suffix):
+                sr_name = key[:-len(link_suffix)]
+                link_karmas[sr_name] = value
+            elif key.endswith(comment_suffix):
+                sr_name = key[:-len(comment_suffix)]
+                comment_karmas[sr_name] = value
+            else:
+                continue
 
-        return karmas
+            combined_karmas[sr_name] += value
+
+        all_karmas = OrderedDict()
+        for sr_name, total in combined_karmas.most_common():
+            all_karmas[sr_name] = (link_karmas[sr_name],
+                                   comment_karmas[sr_name])
+
+        if include_old:
+            old_link_karma = self._t.get('link_karma', 0)
+            old_comment_karma = self._t.get('comment_karma', 0)
+            if old_link_karma or old_comment_karma:
+                all_karmas['ancient history'] = (old_link_karma,
+                                                 old_comment_karma)
+
+        return all_karmas
 
     def update_last_visit(self, current_time):
         from admintools import apply_updates
@@ -233,7 +266,7 @@ class Account(Thing):
             self._load()
         timestr = timestr or time.strftime(COOKIE_TIMESTAMP_FORMAT)
         id_time = str(self._id) + ',' + timestr
-        to_hash = ','.join((id_time, self.password, g.SECRET))
+        to_hash = ','.join((id_time, self.password, g.secrets["SECRET"]))
         return id_time + ',' + hashlib.sha1(to_hash).hexdigest()
 
     def make_admin_cookie(self, first_login=None, last_request=None):
@@ -242,7 +275,7 @@ class Account(Thing):
         first_login = first_login or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         last_request = last_request or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         hashable = ','.join((first_login, last_request, request.ip, request.user_agent, self.password))
-        mac = hmac.new(g.SECRET, hashable, hashlib.sha1).hexdigest()
+        mac = hmac.new(g.secrets["SECRET"], hashable, hashlib.sha1).hexdigest()
         return ','.join((first_login, last_request, mac))
 
     def make_otp_cookie(self, timestamp=None):
@@ -251,7 +284,7 @@ class Account(Thing):
 
         timestamp = timestamp or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         secrets = [request.user_agent, self.otp_secret, self.password]
-        signature = hmac.new(g.SECRET, ','.join([timestamp] + secrets), hashlib.sha1).hexdigest()
+        signature = hmac.new(g.secrets["SECRET"], ','.join([timestamp] + secrets), hashlib.sha1).hexdigest()
 
         return ",".join((timestamp, signature))
 
@@ -259,6 +292,11 @@ class Account(Thing):
         return not g.disable_captcha and self.link_karma < 1
 
     def modhash(self, rand=None, test=False):
+        if c.oauth_user:
+            # OAuth clients should never receive a modhash of any kind
+            # as they could use it in a CSRF attack to bypass their
+            # permitted OAuth scopes.
+            return None
         return modhash(self, rand = rand, test = test)
     
     def valid_hash(self, hash):
@@ -291,6 +329,17 @@ class Account(Thing):
         else:
             raise NotFound, 'Account %s' % name
 
+    @classmethod
+    def _names_to_ids(cls, names, ignore_missing=False, allow_deleted=False,
+                      _update=False):
+        for name in names:
+            uid = cls._by_name_cache(name.lower(), allow_deleted, _update=_update)
+            if not uid:
+                if ignore_missing:
+                    continue
+                raise NotFound('Account %s' % name)
+            yield uid
+
     # Admins only, since it's not memoized
     @classmethod
     def _by_name_multiple(cls, name):
@@ -306,6 +355,14 @@ class Account(Thing):
     @property
     def enemies(self):
         return self.enemy_ids()
+
+    @property
+    def is_moderator_somewhere(self):
+        # modmsgtime can be:
+        #   - a date: the user is a mod somewhere and has unread modmail
+        #   - False: the user is a mod somewhere and has no unread modmail
+        #   - None: (the default) the user is not a mod anywhere
+        return self.modmsgtime is not None
 
     # Used on the goldmember version of /prefs/friends
     @memoize('account.friend_rels')
@@ -377,6 +434,10 @@ class Account(Thing):
         for f in q:
             f._thing1.remove_enemy(f._thing2)
 
+        # wipe out stored password data after a recovery period
+        TryLater.schedule("account_deletion", self._id36,
+                          delay=timedelta(days=90))
+
         # Remove OAuth2Client developer permissions.  This will delete any
         # clients for which this account is the sole developer.
         from r2.models.token import OAuth2Client
@@ -442,43 +503,6 @@ class Account(Thing):
 
         self.share = share
 
-    def set_cup(self, cup_info):
-        from r2.lib.template_helpers import static
-
-        if cup_info is None:
-            return
-
-        if cup_info.get("expiration", None) is None:
-            return
-
-        cup_info.setdefault("label_template",
-          "%(user)s recently won a trophy! click here to see it.")
-
-        cup_info.setdefault("img_url", static('award.png'))
-
-        existing_info = self.cup_info()
-
-        if (existing_info and
-            existing_info["expiration"] > cup_info["expiration"]):
-            # The existing award has a later expiration,
-            # so it trumps the new one as far as cups go
-            return
-
-        td = cup_info["expiration"] - timefromnow("0 seconds")
-
-        cache_lifetime = td.seconds
-
-        if cache_lifetime <= 0:
-            g.log.error("Adding a cup that's already expired?")
-        else:
-            g.hardcache.set("cup_info-%d" % self._id, cup_info, cache_lifetime)
-
-    def remove_cup(self):
-        g.hardcache.delete("cup_info-%d" % self._id)
-
-    def cup_info(self):
-        return g.hardcache.get("cup_info-%d" % self._id)
-
     def special_distinguish(self):
         if self._t.get("special_distinguish_name"):
             return dict((k, self._t.get("special_distinguish_"+k, None))
@@ -520,17 +544,17 @@ class Account(Thing):
     # When true, returns the reason
     @classmethod
     def which_emails_are_banned(cls, canons):
-        banned = g.hardcache.get_multi(canons, prefix="email_banned-")
+        banned = hooks.get_hook('email.get_banned').call(canons=canons)
 
-        # Filter out all the ones that are simply banned by address.
-        # Of the remaining ones, create a dictionary like:
+        # Create a dictionary like:
         # d["abc.def.com"] = [ "bob@abc.def.com", "sue@abc.def.com" ]
         rv = {}
         canons_by_domain = {}
-        for canon in canons:
-            if banned.get(canon, False):
-                rv[canon] = "address"
-                continue
+
+        # email.get_banned will return a list of lists (one layer from the
+        # hooks system, the second from the function itself); chain them
+        # together for easy processing
+        for canon in itertools.chain(*banned):
             rv[canon] = None
 
             at_sign = canon.find("@")
@@ -596,10 +620,6 @@ class Account(Thing):
         return filled_quota
 
     @classmethod
-    def cup_info_multi(cls, ids):
-        return g.hardcache.get_multi(ids, prefix="cup_info-")
-
-    @classmethod
     def system_user(cls):
         try:
             return cls._by_name(g.system_user)
@@ -608,6 +628,12 @@ class Account(Thing):
 
     def flair_enabled_in_sr(self, sr_id):
         return getattr(self, 'flair_%s_enabled' % sr_id, True)
+
+    def flair_text(self, sr_id):
+        return getattr(self, 'flair_%s_text' % sr_id, None)
+
+    def flair_css_class(self, sr_id):
+        return getattr(self, 'flair_%s_css_class' % sr_id, None)
 
     def update_sr_activity(self, sr):
         if not self._spam:
@@ -629,6 +655,49 @@ class Account(Thing):
 
         '''
         return setattr(self, 'received_trophy_%s' % uid, trophy_id)
+
+    @property
+    def employee(self):
+        """Return if the user is an employee.
+
+        Being an employee grants them various special privileges.
+
+        """
+        return (hasattr(self, 'name') and
+                (self.name in g.admins or
+                 self.name in g.sponsors or
+                 self.name in g.employees))
+
+    @property
+    def https_forced(self):
+        """Return whether this account may only be used via HTTPS."""
+        if feature.is_enabled_for("require_https", self):
+            return True
+        return self.pref_force_https
+
+    @property
+    def uses_toolbar(self):
+        return not self.https_forced and self.pref_frame
+
+    @property
+    def has_gold_subscription(self):
+        return bool(getattr(self, 'gold_subscr_id', None))
+
+    @property
+    def has_paypal_subscription(self):
+        return (self.has_gold_subscription and
+                not self.gold_subscr_id.startswith('cus_'))
+
+    @property
+    def has_stripe_subscription(self):
+        return (self.has_gold_subscription and
+                self.gold_subscr_id.startswith('cus_'))
+
+    @property
+    def gold_will_autorenew(self):
+        return (self.has_gold_subscription or
+                (self.pref_creddit_autorenew and self.gold_creddits > 0))
+
 
 class FakeAccount(Account):
     _nodb = True
@@ -706,7 +775,8 @@ def valid_feed(name, feedhash, path):
             pass
 
 def make_feedhash(user, path):
-    return hashlib.sha1("".join([user.name, user.password, g.FEEDSECRET])
+    return hashlib.sha1("".join([user.name, user.password,
+                                 g.secrets["FEEDSECRET"]])
                    ).hexdigest()
 
 def make_feedurl(user, path, ext = "rss"):
@@ -723,28 +793,36 @@ def valid_login(name, password):
         return False
 
     if not a._loaded: a._load()
+
+    hooks.get_hook("account.spotcheck").call(account=a)
+
     if a._banned:
         return False
     return valid_password(a, password)
 
-def valid_password(a, password):
+def valid_password(a, password, compare_password=None):
     # bail out early if the account or password's invalid
     if not hasattr(a, 'name') or not hasattr(a, 'password') or not password:
         return False
 
+    convert_password = False
+    if compare_password is None:
+        convert_password = True
+        compare_password = a.password
+
     # standardize on utf-8 encoding
     password = filters._force_utf8(password)
 
-    if a.password.startswith('$2a$'):
+    if compare_password.startswith('$2a$'):
         # it's bcrypt.
-        expected_hash = bcrypt.hashpw(password, a.password)
-        if not constant_time_compare(a.password, expected_hash):
+        expected_hash = bcrypt.hashpw(password, compare_password)
+        if not constant_time_compare(compare_password, expected_hash):
             return False
 
         # if it's using the current work factor, we're done, but if it's not
         # we'll have to rehash.
         # the format is $2a$workfactor$salt+hash
-        work_factor = int(a.password.split("$")[2])
+        work_factor = int(compare_password.split("$")[2])
         if work_factor == g.bcrypt_work_factor:
             return a
     else:
@@ -752,17 +830,18 @@ def valid_password(a, password):
         # if the length of the stored hash is 43 bytes, the sha-1 hash has a salt
         # otherwise it's sha-1 with no salt.
         salt = ''
-        if len(a.password) == 43:
-            salt = a.password[:3]
+        if len(compare_password) == 43:
+            salt = compare_password[:3]
         expected_hash = passhash(a.name, password, salt)
 
-        if not constant_time_compare(a.password, expected_hash):
+        if not constant_time_compare(compare_password, expected_hash):
             return False
 
     # since we got this far, it's a valid password but in an old format
     # let's upgrade it
-    a.password = bcrypt_password(password)
-    a._commit()
+    if convert_password:
+        a.password = bcrypt_password(password)
+        a._commit()
     return a
 
 def bcrypt_password(password):
@@ -778,6 +857,7 @@ def passhash(username, password, salt = ''):
 def change_password(user, newpassword):
     user.password = bcrypt_password(newpassword)
     user._commit()
+    LastModified.touch(user._fullname, 'Password')
     return True
 
 #TODO reset the cache
@@ -847,3 +927,44 @@ class AccountsActiveBySR(tdb_cassandra.View):
     @memoize('accounts_active', time=60)
     def get_count_cached(cls, sr_id):
         return cls._cf.get_count(sr_id)
+
+
+class BlockedSubredditsByAccount(tdb_cassandra.DenormalizedRelation):
+    _use_db = True
+    _last_modified_name = 'block_subreddit'
+    _read_consistency_level = tdb_cassandra.CL.QUORUM
+    _write_consistency_level = tdb_cassandra.CL.QUORUM
+    _connection_pool = 'main'
+    _views = []
+
+    @classmethod
+    def value_for(cls, thing1, thing2):
+        return ''
+
+    @classmethod
+    def block(cls, user, sr):
+        cls.create(user, sr)
+
+    @classmethod
+    def unblock(cls, user, sr):
+        cls.destroy(user, sr)
+
+    @classmethod
+    def is_blocked(cls, user, sr):
+        try:
+            r = cls.fast_query(user, [sr])
+        except tdb_cassandra.NotFound:
+            return False
+        return (user, sr) in r
+
+
+@trylater_hooks.on("trylater.account_deletion")
+def on_account_deletion(mature_items):
+    for account_id36 in mature_items.itervalues():
+        account = Account._byID36(account_id36, data=True)
+
+        if not account._deleted:
+            continue
+
+        account.password = ""
+        account._commit()

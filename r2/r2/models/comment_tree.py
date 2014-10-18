@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -33,8 +33,6 @@ from pylons import g
 
 
 class CommentTreeStorageBase(object):
-    _maintain_num_children = True
-
     class NoOpContext:
         def __enter__(self):
             pass
@@ -58,21 +56,6 @@ class CommentTreeStorageBase(object):
     def add_comments(cls, tree, comments):
         cids = tree.cids
         depth = tree.depth
-        num_children = tree.num_children
-
-        #dfs to find the list of parents for the new comment
-        def find_parents(cid):
-            # initialize stack with copy of top-level cids
-            stack = tree.tree[None][:]
-            parents = []
-            while stack:
-                cur = stack.pop()
-                if cur == cid:
-                    return parents
-                elif cur in tree.tree:
-                    #make cur the end of the parents list
-                    parents = parents[:depth[cur]] + [cur]
-                    stack.extend(tree.tree[cur])
 
         new_parents = {}
         for comment in comments:
@@ -93,16 +76,9 @@ class CommentTreeStorageBase(object):
             #add to depth
             depth[cid] = depth[p_id] + 1 if p_id else 0
 
-            #update children
-            if cls._maintain_num_children:
-                num_children[cid] = 0
-
             #if this comment had a parent, find the parent's parents
             if p_id:
                 new_parents[cid] = p_id
-                if cls._maintain_num_children:
-                    for p_id in find_parents(cid):
-                        num_children[p_id] += 1
 
         # update our cache of children -> parents as well:
         if not tree.parents:
@@ -126,8 +102,111 @@ class CommentTreeStorageBase(object):
                 tree.cids.remove(comment._id)
             if comment._id in tree.depth:
                 del tree.depth[comment._id]
-            if comment._id in tree.num_children:
-                del tree.num_children[comment._id]
+
+
+class CommentTreeStorageV3(CommentTreeStorageBase):
+    """Cassandra column-based storage for comment trees.
+
+    Under this implementation, each column in a link's row corresponds to a
+    comment on that link. The column name is an encoding of the tuple of
+    (depth, comment.parent_id, comment._id), and the value is not used.
+
+    Key features:
+        - does not use permacache!
+        - does not require locking for updates
+    """
+
+    __metaclass__ = tdb_cassandra.ThingMeta
+    _connection_pool = 'main'
+    _use_db = True
+
+    _type_prefix = None
+    _cf_name = 'CommentTreeStorage'
+
+    # column names are tuples of (depth, parent_id, comment_id)
+    _compare_with = types.CompositeType(
+        types.LongType(),
+        types.LongType(),
+        types.LongType())
+
+    COLUMN_READ_BATCH_SIZE = tdb_cassandra.max_column_count
+    COLUMN_WRITE_BATCH_SIZE = 1000
+
+    # special value for parent_id when the comment has no parent
+    NO_PARENT = -1
+
+    @staticmethod
+    def _key(link):
+        return utils.to36(link._id)
+
+    @classmethod
+    def by_link(cls, link):
+        try:
+            row = cls.get_row(cls._key(link))
+        except ttypes.NotFoundException:
+            row = {}
+        return cls._from_row(row)
+
+    @classmethod
+    def get_row(cls, key):
+        return cls._cf.xget(key, buffer_size=cls.COLUMN_READ_BATCH_SIZE)
+
+    @classmethod
+    def _from_row(cls, row):
+        # row is an iterable of (depth, parent_id, comment_id), '')
+        cids = []
+        tree = {}
+        depth = {}
+        parents = {}
+        for (d, pid, cid), val in row:
+            if pid == cls.NO_PARENT:
+                pid = None
+
+            cids.append(cid)
+            tree.setdefault(pid, []).append(cid)
+            depth[cid] = d
+            parents[cid] = pid
+        return dict(cids=cids, tree=tree, depth=depth, parents=parents)
+
+    @classmethod
+    @tdb_cassandra.will_write
+    def rebuild(cls, tree, comments):
+        with batch.Mutator(g.cassandra_pools[cls._connection_pool]) as m:
+            g.log.debug('removing tree from %s', cls._key(tree.link))
+            m.remove(cls._cf, cls._key(tree.link))
+
+        return cls.add_comments(tree, comments)
+
+    @classmethod
+    @tdb_cassandra.will_write
+    def add_comments(cls, tree, comments):
+        CommentTreeStorageBase.add_comments(tree, comments)
+        updates = {}
+        for comment in comments:
+            parent_id = comment.parent_id or cls.NO_PARENT
+            depth = tree.depth.get(parent_id, -1) + 1
+            updates[(depth, parent_id, comment._id)] = ''
+
+        cols = updates.keys()
+        for i in xrange(0, len(updates), cls.COLUMN_WRITE_BATCH_SIZE):
+            update_batch = {c: updates[c]
+                            for c in cols[i:i + cls.COLUMN_WRITE_BATCH_SIZE]}
+            with batch.Mutator(g.cassandra_pools[cls._connection_pool]) as m:
+                m.insert(cls._cf, cls._key(tree.link), update_batch)
+
+    @classmethod
+    @tdb_cassandra.will_write
+    def upgrade(cls, tree, link):
+        cids = []
+        for parent, children in tree.tree.iteritems():
+            cids.extend(children)
+
+        comments = {}
+        for i in xrange(0, len(cids), 100):
+            g.log.debug('  loading comments %d..%d', i, i + 100)
+            comments.update(Comment._byID(cids[i:i + 100], data=True))
+
+        cls.add_comments(tree, comments.values())
 
 
 class CommentTreeStorageV2(CommentTreeStorageBase):
@@ -189,29 +268,15 @@ class CommentTreeStorageV2(CommentTreeStorageBase):
 
     @classmethod
     def get_row(cls, key):
-        row = []
-        size = 0
-        column_start = ''
-        while True:
-            batch = cls._cf.get(key, column_count=cls.COLUMN_READ_BATCH_SIZE,
-                                column_start=column_start)
-            row.extend(batch.iteritems())
-            num_fetched = len(row) - size
-            size = len(row)
-            if num_fetched < cls.COLUMN_READ_BATCH_SIZE:
-                break
-            depth, pid, cid = row[-1][0]
-            column_start = (depth, pid if pid is not None else -1, cid + 1)
-        return row
+        return cls._cf.xget(key, buffer_size=cls.COLUMN_READ_BATCH_SIZE)
 
     @classmethod
     def _from_row(cls, row):
-        # row is a dict of {(depth, parent_id, comment_id): subtree_size}
+        # row is an iterable of ((depth, parent_id, comment_id), subtree_size)
         cids = []
         tree = {}
         depth = {}
         parents = {}
-        num_children = {}
         for (d, pid, cid), val in row:
             if cid == -1:
                 continue
@@ -221,9 +286,7 @@ class CommentTreeStorageV2(CommentTreeStorageBase):
             tree.setdefault(pid, []).append(cid)
             depth[cid] = d
             parents[cid] = pid
-            num_children[cid] = val - 1
-        return dict(cids=cids, tree=tree, depth=depth,
-                    num_children=num_children, parents=parents)
+        return dict(cids=cids, tree=tree, depth=depth, parents=parents)
 
     @classmethod
     @tdb_cassandra.will_write
@@ -352,22 +415,27 @@ class CommentTreeStorageV1(CommentTreeStorageBase):
         r = g.permacache.get(key)
         if not r:
             return None
-        cids, cid_tree, depth, num_children = r
+
+        try:
+            cids, cid_tree, depth = r
+        except ValueError:
+            # We got the old version that includes num_children
+            cids, cid_tree, depth, num_children = r
+
         parents = g.permacache.get(p_key)
         if parents is None:
             parents = {}
-        return dict(cids=cids, tree=cid_tree, depth=depth,
-                    num_children=num_children, parents=parents)
+        return dict(cids=cids, tree=cid_tree, depth=depth, parents=parents)
 
     @classmethod
     def add_comments(cls, tree, comments):
         with cls.mutation_context(tree.link):
             CommentTreeStorageBase.add_comments(tree, comments)
-            g.permacache.set(cls._comments_key(tree.link_id),
-                             (tree.cids, tree.tree, tree.depth,
-                             tree.num_children))
+            # for read safety write parents first
             g.permacache.set(cls._parent_comments_key(tree.link_id),
                              tree.parents)
+            g.permacache.set(cls._comments_key(tree.link_id),
+                             (tree.cids, tree.tree, tree.depth))
 
 
 class CommentTree:
@@ -385,9 +453,6 @@ class CommentTree:
       - depth: dict of int to int; each entry in cids has a key in this dict,
           and the corresponding value is that comment's depth in the tree
           (with a value of 0 for top-level comments)
-      - num_children: dict of int to int; each entry in cids has a key in this
-          dict, and the corresponding value is the count of that comment's
-          descendents in the tree
       - parents: dict of int to int; each entry in cids has a key in this dict,
           and the corresponding value is the ID of that comment's parent (or
           None in the case of top-level comments)
@@ -396,9 +461,10 @@ class CommentTree:
     IMPLEMENTATIONS = {
         1: CommentTreeStorageV1,
         2: CommentTreeStorageV2,
+        3: CommentTreeStorageV3,
     }
 
-    DEFAULT_IMPLEMENTATION = 2
+    DEFAULT_IMPLEMENTATION = 3
 
     def __init__(self, link, **kw):
         self.link = link
@@ -445,8 +511,7 @@ class CommentTree:
         comments = sorted(q, key=lambda c: c.parent_id)
 
         # build tree from scratch (for V2 results in double-counting in cass)
-        tree = cls(link, cids=[], tree={}, depth={}, num_children={},
-                   parents={})
+        tree = cls(link, cids=[], tree={}, depth={}, parents={})
         impl = cls.IMPLEMENTATIONS[link.comment_tree_version]
         impl.rebuild(tree, comments)
 
@@ -459,12 +524,12 @@ class CommentTree:
     def upgrade(cls, link, to_version=None):
         if to_version is None:
             to_version = cls.DEFAULT_IMPLEMENTATION
-        while link.comment_tree_version < to_version:
-            tree = cls.by_link(link)
-            new_impl = cls.IMPLEMENTATIONS[link.comment_tree_version + 1]
-            new_impl.upgrade(tree, link)
-            link.comment_tree_version += 1
-            link._commit()
+
+        tree = cls.by_link(link)
+        new_impl = cls.IMPLEMENTATIONS[to_version]
+        new_impl.upgrade(tree, link)
+        link.comment_tree_version = to_version
+        link._commit()
 
     @staticmethod
     def parent_dict_from_tree(tree):

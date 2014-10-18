@@ -16,17 +16,19 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
+import hmac
+import hashlib
+
 from r2.models import *
 from filters import unsafe, websafe, _force_unicode, _force_utf8
-from r2.lib.utils import UrlParser, timesince, is_subdomain
+from r2.lib.utils import UrlParser, timeago, timesince, is_subdomain
 
 from r2.lib import hooks
 from r2.lib.static import static_mtime
-from r2.lib.media import s3_direct_url
 from r2.lib import js
 
 import babel.numbers
@@ -36,21 +38,10 @@ from copy import copy
 import random
 import urlparse
 import calendar
+import math
+import time
 from pylons import g, c, request
 from pylons.i18n import _, ungettext
-
-
-def static_domain(kind, secure):
-    if kind == 'sr_stylesheet':
-        if secure:
-            return g.static_secure_sr_stylesheet_domain
-        else:
-            return g.static_sr_stylesheet_domain
-    else:
-        if secure:
-            return g.static_secure_domain
-        else:
-            return g.static_domain
 
 
 static_text_extensions = {
@@ -58,7 +49,7 @@ static_text_extensions = {
     '.css': 'css',
     '.less': 'css'
 }
-def static(path, allow_gzip=True, kind='default'):
+def static(path):
     """
     Simple static file maintainer which automatically paths and
     versions files being served out of static.
@@ -70,22 +61,13 @@ def static(path, allow_gzip=True, kind='default'):
     dirname, filename = os.path.split(path)
     extension = os.path.splitext(filename)[1]
     is_text = extension in static_text_extensions
-    can_gzip = is_text and 'gzip' in request.accept_encoding
-    should_gzip = allow_gzip and can_gzip
     should_cache_bust = False
 
     path_components = []
     actual_filename = None
-    suffix = ''
 
-    scheme = 'https' if c.secure else 'http'
-    domain = static_domain(kind, c.secure)
-    if domain:
-        if should_gzip:
-            if c.secure and g.static_secure_pre_gzipped:
-                suffix = '.gzip'
-            elif not c.secure and g.static_pre_gzipped:
-                suffix = '.gzip'
+    if g.static_domain:
+        domain = g.static_domain
     else:
         path_components.append(c.site.static_path)
 
@@ -97,13 +79,12 @@ def static(path, allow_gzip=True, kind='default'):
             should_cache_bust = True
             actual_filename = filename
 
-        scheme = None
         domain = None
 
     path_components.append(dirname)
     if not actual_filename:
         actual_filename = g.static_names.get(filename, filename)
-    path_components.append(actual_filename + suffix)
+    path_components.append(actual_filename)
 
     actual_path = os.path.join(*path_components)
 
@@ -113,7 +94,7 @@ def static(path, allow_gzip=True, kind='default'):
         query = 'v=' + str(file_id)
 
     return urlparse.urlunsplit((
-        scheme,
+        None,
         domain,
         actual_path,
         query,
@@ -121,49 +102,86 @@ def static(path, allow_gzip=True, kind='default'):
     ))
 
 
-def s3_https_if_secure(url):
-    # In the event that more media sources (other than s3) are added, this function should be corrected
+def make_url_protocol_relative(url):
+    if not url:
+        return url
+
+    assert url.startswith("http://"), "make_url_protocol_relative: not http"
+    return url[len("http:"):]
+
+
+def media_https_if_secure(url):
     if not c.secure:
         return url
-    replace = "https://"
-    if not url.startswith("http://%s" % s3_direct_url):
-         replace = "https://%s/" % s3_direct_url
-    return url.replace("http://", replace)
+    return g.media_provider.convert_to_https(url)
+
+
+def header_url(url):
+    if url == g.default_header_url:
+        return static(url)
+    else:
+        return media_https_if_secure(url)
+
 
 def js_config(extra_config=None):
+    logged = c.user_is_loggedin and c.user.name
+    gold = bool(logged and c.user.gold)
+
+    controller_name = request.environ['pylons.routes_dict']['controller']
+    action_name = request.environ['pylons.routes_dict']['action']
+    mac = hmac.new(g.secrets["action_name"], controller_name + '.' + action_name, hashlib.sha1)
+    verification = mac.hexdigest()
+
     config = {
         # is the user logged in?
-        "logged": c.user_is_loggedin and c.user.name,
+        "logged": logged,
         # the subreddit's name (for posts)
         "post_site": c.site.name if not c.default_sr else "",
-        # are we in an iframe?
-        "cnameframe": bool(c.cname and not c.authorized_cname),
         # the user's voting hash
         "modhash": c.modhash or False,
         # the current rendering style
         "renderstyle": c.render_style,
+
+        # they're welcome to try to override this in the DOM because we just
+        # disable the features server-side if applicable
+        'store_visits': gold and c.user.pref_store_visits,
+
         # current domain
         "cur_domain": get_domain(cname=c.frameless_cname, subreddit=False, no_www=True),
         # where do ajax requests go?
         "ajax_domain": get_domain(cname=c.authorized_cname, subreddit=False),
+        "stats_domain": g.stats_domain or '',
         "extension": c.extension,
         "https_endpoint": is_subdomain(request.host, g.domain) and g.https_endpoint,
+        # does the client only want to communicate over HTTPS?
+        "https_forced": c.user.https_forced,
         # debugging?
         "debug": g.debug,
+        "send_logs": g.live_config["frontend_logging"],
+        "server_time": math.floor(time.time()),
         "status_msg": {
           "fetching": _("fetching title..."),
           "submitting": _("submitting..."),
           "loading": _("loading...")
         },
         "is_fake": isinstance(c.site, FakeSubreddit),
-        "fetch_trackers_url": g.fetch_trackers_url,
         "adtracker_url": g.adtracker_url,
         "clicktracker_url": g.clicktracker_url,
         "uitracker_url": g.uitracker_url,
         "static_root": static(''),
         "over_18": bool(c.over18),
+        "new_window": bool(c.user.pref_newwindow),
         "vote_hash": c.vote_hash,
+        "gold": gold,
+        "has_subscribed": logged and c.user.has_subscribed,
+        "pageInfo": {
+          "verification": verification,
+          "actionName": controller_name + '.' + action_name,
+        },
     }
+
+    if g.uncompressedJS:
+        config["uncompressedJS"] = True
 
     if extra_config:
         config.update(extra_config)
@@ -186,7 +204,7 @@ class JSPreload(js.DataSource):
         from r2.lib.pages.things import wrap_things
         if not isinstance(wrapped, Wrapped):
             wrapped = wrap_things(wrapped)[0]
-        self.data[url] = wrapped.render_nocache('', style='api').finalize()
+        self.data[url] = wrapped.render_nocache('api').finalize()
 
     def use(self):
         hooks.get_hook("js_preload.use").call(js_preload=self)
@@ -225,13 +243,13 @@ def comment_label(num_comments=None):
     if not num_comments:
         # generates "comment" the imperative verb
         com_label = _("comment {verb}")
-        com_cls = 'comments empty'
+        com_cls = 'comments empty may-blank'
     else:
         # generates "XX comments" as a noun
         com_label = ungettext("comment", "comments", num_comments)
         com_label = strings.number_label % dict(num=num_comments,
                                                 thing=com_label)
-        com_cls = 'comments'
+        com_cls = 'comments may-blank'
     return com_label, com_cls
 
 def replace_render(listing, item, render_func):
@@ -255,31 +273,15 @@ def replace_render(listing, item, render_func):
             replacements['childlisting'] = ''
 
         #only LinkListing has a show_nums attribute
-        if listing:
-            if hasattr(listing, "show_nums"):
-                if listing.show_nums:
-                    num_str = str(item.num)
-                    if hasattr(listing, "num_margin"):
-                        num_margin = str(listing.num_margin)
-                    else:
-                        num_margin = "%.2fex" % (len(str(listing.max_num))*1.1)
-                else:
-                    num_str = ''
-                    num_margin = "0px;display:none"
+        if listing and hasattr(listing, "show_nums"):
+            if listing.show_nums and item.num > 0:
+                num = str(item.num)
+            else:
+                num = ""
+            replacements["num"] = num
 
-                replacements["numcolmargin"] = num_margin
-                replacements["num"] = num_str
-
-            if hasattr(listing, "max_score"):
-                mid_margin = len(str(listing.max_score))
-                if hasattr(listing, "mid_margin"):
-                    mid_margin = str(listing.mid_margin)
-                elif mid_margin == 1:
-                    mid_margin = "15px"
-                else:
-                    mid_margin = "%dex" % (mid_margin+1)
-
-                replacements["midcolmargin"] = mid_margin
+        if getattr(item, "rowstyle_cls", None):
+            replacements["rowstyle"] = item.rowstyle_cls
 
         if hasattr(item, "num_comments"):
             com_label, com_cls = comment_label(item.num_comments)
@@ -287,6 +289,12 @@ def replace_render(listing, item, render_func):
                 com_label = unicode(item.num_comments)
             replacements['numcomments'] = com_label
             replacements['commentcls'] = com_cls
+
+        if hasattr(item, "num_children"):
+            label = ungettext("child", "children", item.num_children)
+            numchildren_text = strings.number_label % {'num': item.num_children,
+                                                       'thing': label}
+            replacements['numchildren_text'] = numchildren_text
 
         replacements['display'] =  "" if display else "style='display:none'"
 
@@ -301,16 +309,16 @@ def replace_render(listing, item, render_func):
             if hasattr(item, "promoted") and item.promoted is not None:
                 from r2.lib import promote
                 # promoted links are special in their date handling
-                replacements['timesince'] = timesince(item._date -
-                                                      promote.timezone_offset)
+                replacements['timesince'] = \
+                    simplified_timesince(item._date - promote.timezone_offset)
             else:
-                replacements['timesince'] = timesince(item._date)
+                replacements['timesince'] = simplified_timesince(item._date)
 
             replacements['time_period'] = calc_time_period(item._date)
 
         # compute the last edited time here so we don't end up caching it
         if hasattr(item, "editted") and not isinstance(item.editted, bool):
-            replacements['lastedited'] = timesince(item.editted)
+            replacements['lastedited'] = simplified_timesince(item.editted)
 
         # Set in front.py:GET_comments()
         replacements['previous_visits_hex'] = c.previous_visits_hex
@@ -480,17 +488,12 @@ def choose_width(link, width):
         else:
             return 110
 
-def panel_size(state):
-    "the frame.cols of the reddit-toolbar's inner frame"
-    return '400px, 100%' if state =='expanded' else '0px, 100%x'
-
 # Appends to the list "attrs" a tuple of:
 # <priority (higher trumps lower), letter,
-#  css class, i18n'ed mouseover label, hyperlink (opt), img (opt)>
+#  css class, i18n'ed mouseover label, hyperlink (opt)>
 def add_attr(attrs, kind, label=None, link=None, cssclass=None, symbol=None):
     from r2.lib.template_helpers import static
 
-    img = None
     symbol = symbol or kind
 
     if kind == 'F':
@@ -538,10 +541,10 @@ def add_attr(attrs, kind, label=None, link=None, cssclass=None, symbol=None):
             raise ValueError ("Need a label")
     elif kind == 'special':
         priority = 98
-    elif kind.startswith ('trophy:'):
-        img = (kind[7:], '!', 11, 8)
+    elif kind == "cake":
         priority = 99
-        cssclass = 'recent-trophywinner'
+        cssclass = "cakeday"
+        symbol = "&#x1F370;"
         if not label:
             raise ValueError ("Need a label")
         if not link:
@@ -549,7 +552,7 @@ def add_attr(attrs, kind, label=None, link=None, cssclass=None, symbol=None):
     else:
         raise ValueError ("Got weird kind [%s]" % kind)
 
-    attrs.append( (priority, symbol, cssclass, label, link, img) )
+    attrs.append( (priority, symbol, cssclass, label, link) )
 
 
 def search_url(query, subreddit, restrict_sr="off", sort=None, recent=None):
@@ -574,6 +577,10 @@ def format_number(number, locale=None):
     return babel.numbers.format_number(number, locale=locale)
 
 
+def format_percent(ratio, locale=None):
+    return babel.numbers.format_percent(ratio, locale=locale or c.locale)
+
+
 def html_datetime(date):
     # Strip off the microsecond to appease the HTML5 gods, since
     # datetime.isoformat() returns too long of a microsecond value.
@@ -583,3 +590,26 @@ def html_datetime(date):
 
 def js_timestamp(date):
     return '%d' % (calendar.timegm(date.timetuple()) * 1000)
+
+
+def simplified_timesince(date, include_tense=True):
+    if date > timeago("1 minute"):
+        return _("just now")
+
+    since = []
+    since.append(timesince(date))
+    if include_tense:
+        since.append(_("ago"))
+    return " ".join(since)
+
+
+def display_link_karma(karma):
+    if not c.user_is_admin:
+        return max(karma, g.link_karma_display_floor)
+    return karma
+
+
+def display_comment_karma(karma):
+    if not c.user_is_admin:
+        return max(karma, g.comment_karma_display_floor)
+    return karma

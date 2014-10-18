@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -37,52 +37,55 @@ from r2.lib.validator import validate, VOneOf
 # Each section can have a title and a markdown-formatted description.
 section_info = {
     'account': {
-        'title': _('account'),
+        'title': 'account',
     },
     'apps': {
-        'title': _('apps'),
+        'title': 'apps',
     },
     'flair': {
-        'title': _('flair'),
+        'title': 'flair',
+    },
+    'gold': {
+        'title': 'reddit gold',
     },
     'links_and_comments': {
-        'title': _('links & comments'),
+        'title': 'links & comments',
     },
     'messages': {
-        'title': _('private messages'),
+        'title': 'private messages',
     },
     'moderation': {
-        'title': _('moderation'),
+        'title': 'moderation',
     },
     'misc': {
-        'title': _('misc'),
+        'title': 'misc',
     },
     'listings': {
-        'title': _('listings'),
+        'title': 'listings',
     },
     'search': {
-        'title': _('search'),
+        'title': 'search',
     },
     'subreddits': {
-        'title': _('subreddits'),
+        'title': 'subreddits',
     },
     'multis': {
-        'title': _('multis'),
+        'title': 'multis',
     },
     'users': {
-        'title': _('users'),
+        'title': 'users',
     },
     'wiki': {
-        'title': _('wiki'),
+        'title': 'wiki',
     },
     'captcha': {
-        'title': _('captcha'),
+        'title': 'captcha',
     }
 }
 
 api_section = Storage((k, k) for k in section_info)
 
-def api_doc(section, **kwargs):
+def api_doc(section, uses_site=False, **kwargs):
     """
     Add documentation annotations to the decorated function.
 
@@ -93,13 +96,22 @@ def api_doc(section, **kwargs):
         if 'extends' in kwargs:
             kwargs['extends'] = kwargs['extends']._api_doc
         doc.update(kwargs)
+        doc['uses_site'] = uses_site
         doc['section'] = section
         doc['lineno'] = api_function.func_code.co_firstlineno
 
         file_path = abspath(api_function.func_code.co_filename)
+
         root_dir = g.paths['root']
         if file_path.startswith(root_dir):
             doc['relfilepath'] = relpath(file_path, root_dir)
+            doc['source_root_url'] = "https://github.com/reddit/reddit/blob/master/r2/r2/"
+        else:
+            for plugin in g.plugins:
+                plugin_root = plugin.path
+                if plugin.source_root_url and file_path.startswith(plugin_root):
+                    doc['relfilepath'] = relpath(file_path, plugin_root)
+                    doc['source_root_url'] = plugin.source_root_url
 
         return api_function
     return add_metadata
@@ -120,6 +132,7 @@ class ApidocsController(RedditController):
         - `extensions`: URI extensions the API method supports
         - `parameters`: Dictionary of possible parameter names and descriptions.
         - `extends`: API method from which to inherit documentation
+        - `json_model`: The JSON model used instead of normal POST parameters
         """
 
         api_docs = defaultdict(lambda: defaultdict(dict))
@@ -128,7 +141,7 @@ class ApidocsController(RedditController):
             if not action:
                 continue
 
-            valid_methods = ('GET', 'POST', 'PUT', 'DELETE')
+            valid_methods = ('GET', 'POST', 'PUT', 'DELETE', 'PATCH')
             api_doc = getattr(func, '_api_doc', None)
             if api_doc and 'section' in api_doc and method in valid_methods:
                 docs = {}
@@ -140,6 +153,15 @@ class ApidocsController(RedditController):
                     docs['parameters'] = {}
                 docs.update(api_doc)
 
+                # append a message to the docstring if supplied
+                notes = docs.get("notes")
+                if notes:
+                    notes = "\n".join(notes)
+                    if docs["doc"]:
+                        docs["doc"] += "\n\n" + notes
+                    else:
+                        docs["doc"] = notes
+
                 uri = docs.get('uri') or '/'.join((url_prefix, action))
                 if 'extensions' in docs:
                     # if only one extension was specified, add it to the URI.
@@ -148,13 +170,24 @@ class ApidocsController(RedditController):
                         del docs['extensions']
                 docs['uri'] = uri
 
+                if api_doc['uses_site']:
+                    docs["in-subreddit"] = True
+
                 oauth_perms = getattr(func, 'oauth2_perms', {})
-                docs['oauth_scopes'] = oauth_perms.get('allowed_scopes', [])
+                oauth_allowed = oauth_perms.get('oauth2_allowed', False)
+                if not oauth_allowed:
+                    # Endpoint is not available over OAuth
+                    docs['oauth_scopes'] = []
+                else:
+                    # [None] signifies to the template to state
+                    # that the endpoint is accessible to any oauth client
+                    docs['oauth_scopes'] = (oauth_perms['required_scopes'] or
+                                            [None])
 
                 # add every variant to the index -- the templates will filter
                 # out variants in the long-form documentation
                 if oauth_only:
-                    if not docs['oauth_scopes']:
+                    if not oauth_allowed:
                         continue
                     for scope in docs['oauth_scopes']:
                         for variant in chain([uri],
@@ -171,25 +204,31 @@ class ApidocsController(RedditController):
     def GET_docs(self, mode):
         # controllers to gather docs from.
         from r2.controllers.api import ApiController, ApiminimalController
-        from r2.controllers.apiv1 import APIv1Controller
+        from r2.controllers.apiv1.user import APIv1UserController
+        from r2.controllers.apiv1.gold import APIv1GoldController
         from r2.controllers.captcha import CaptchaController
         from r2.controllers.front import FrontController
-        from r2.controllers.wiki import WikiApiController
+        from r2.controllers.wiki import WikiApiController, WikiController
         from r2.controllers.multi import MultiApiController
         from r2.controllers import listingcontroller
 
         api_controllers = [
-            (APIv1Controller, '/api/v1'),
+            (APIv1UserController, '/api/v1'),
+            (APIv1GoldController, '/api/v1'),
             (ApiController, '/api'),
             (ApiminimalController, '/api'),
             (WikiApiController, '/api/wiki'),
+            (WikiController, '/wiki'),
             (MultiApiController, '/api/multi'),
             (CaptchaController, ''),
-            (FrontController, '')
+            (FrontController, ''),
         ]
         for name, value in vars(listingcontroller).iteritems():
             if name.endswith('Controller'):
                 api_controllers.append((value, ''))
+
+        # bring in documented plugin controllers
+        api_controllers.extend(g.plugins.get_documented_controllers())
 
         # merge documentation info together.
         api_docs = defaultdict(dict)

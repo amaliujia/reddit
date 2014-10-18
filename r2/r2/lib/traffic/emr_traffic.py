@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -28,18 +28,16 @@ from time import time, sleep
 from boto.emr.step import InstallPigStep, PigStep
 from boto.emr.bootstrap_action import BootstrapAction
 
-from r2.lib.emr_helpers import (EmrJob, get_compatible_jobflows,
-    get_step_state, EmrException, update_jobflows_cached,
-    LIVE_STATES, COMPLETED, PENDING, NOTFOUND)
-
-
-class MemoryIntesiveBootstrap(BootstrapAction):
-    def __init__(self):
-        name = 'memory intensive'
-        path = 's3://elasticmapreduce/bootstrap-actions/' \
-               'configurations/latest/memory-intensive'
-        args = []
-        BootstrapAction.__init__(self, name, path, args)
+from r2.lib.emr_helpers import (
+    EmrException,
+    EmrJob,
+    get_compatible_jobflows,
+    get_step_state,
+    LIVE_STATES,
+    COMPLETED,
+    PENDING,
+    NOTFOUND,
+)
 
 
 class TrafficBase(EmrJob):
@@ -73,7 +71,7 @@ class TrafficBase(EmrJob):
         path = cls.BOOTSTRAP_SCRIPT
         bootstrap_action_args = [g.TRAFFIC_SRC_DIR, g.tracking_secret]
         bootstrap = BootstrapAction(name, path, bootstrap_action_args)
-        return [MemoryIntesiveBootstrap(), bootstrap]
+        return [bootstrap]
 
     @classmethod
     def _setup_steps(self):
@@ -154,8 +152,8 @@ def _wait_for_step(emr_connection, step, jobflowid, sleeptime):
     """Poll EMR and wait for a step to finish."""
     sleep(180)
     start = time()
-    update_jobflows_cached(emr_connection)
-    step_state = get_step_state(emr_connection, jobflowid, step.name)
+    step_state = get_step_state(emr_connection, jobflowid, step.name,
+                                update=True)
     while step_state in LIVE_STATES + [PENDING]:
         sleep(sleeptime)
         step_state = get_step_state(emr_connection, jobflowid, step.name)

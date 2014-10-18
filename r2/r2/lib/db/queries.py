@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -29,12 +29,13 @@ from r2.lib.utils import fetch_things2, tup, UniqueIterator, set_last_modified
 from r2.lib import utils
 from r2.lib import amqp, sup, filters
 from r2.lib.comment_tree import add_comments, update_comment_votes
-from r2.models.promo import PROMOTE_STATUS, get_promote_srid
+from r2.models.promo import PROMOTE_STATUS, PromotionLog
 from r2.models.query_cache import (
     cached_query,
     CachedQuery,
     CachedQueryMutator,
     filter_thing,
+    FakeQuery,
     merged_cached_query,
     MergedCachedQuery,
     SubredditQueryCache,
@@ -42,7 +43,7 @@ from r2.models.query_cache import (
     UserQueryCache,
 )
 from r2.models.last_modified import LastModified
-from r2.lib.utils import SimpleSillyStub
+from r2.lib.utils import in_chunks, SimpleSillyStub
 
 import cPickle as pickle
 
@@ -176,27 +177,36 @@ class CachedResults(object):
            under certain criteria, see can_insert."""
         self._insert_tuples([self.make_item_tuple(item) for item in tup(items)])
 
-    def _insert_tuples(self, t):
+    def _insert_tuples(self, tuples):
         def _mutate(data):
             data = data or []
+            item_tuples = tuples or []
 
-            # short-circuit if we already know that no item to be
-            # added qualifies to be stored. Since we know that this is
-            # sorted descending by datum[1:], we can just check the
-            # last item and see if we're smaller than it is
-            if (len(data) >= precompute_limit
-                and all(x[1:] < data[-1][1:]
-                        for x in t)):
+            existing_fnames = {item[0] for item in data}
+            new_fnames = {item[0] for item in item_tuples}
+
+            mutated_length = len(existing_fnames.union(new_fnames))
+            would_truncate = mutated_length >= precompute_limit
+            if would_truncate:
+                # only insert items that are already stored or new items
+                # that are large enough that they won't be immediately truncated
+                # out of storage
+                # item structure is (name, sortval1[, sortval2, ...])
+                smallest = data[-1]
+                item_tuples = [item for item in item_tuples
+                                    if (item[0] in existing_fnames or
+                                        item[1:] >= smallest[1:])]
+
+            if not item_tuples:
                 return data
 
-            # insert the new items, remove the duplicates (keeping the
+            # insert the items, remove the duplicates (keeping the
             # one being inserted over the stored value if applicable),
             # and sort the result
-            newfnames = set(x[0] for x in t)
-            data = filter(lambda x: x[0] not in newfnames, data)
-            data.extend(t)
+            data = filter(lambda x: x[0] not in new_fnames, data)
+            data.extend(item_tuples)
             data.sort(reverse=True, key=lambda x: x[1:])
-            if len(t) + len(data) > precompute_limit:
+            if len(data) > precompute_limit:
                 data = data[:precompute_limit]
             return data
 
@@ -350,6 +360,29 @@ def get_spam_comments(sr_id):
     return Comment._query(Comment.c.sr_id == sr_id,
                           Comment.c._spam == True,
                           sort = db_sort('new'))
+
+
+@cached_query(SubredditQueryCache)
+def get_edited_comments(sr_id):
+    return FakeQuery(sort=[desc("editted")])
+
+
+@cached_query(SubredditQueryCache)
+def get_edited_links(sr_id):
+    return FakeQuery(sort=[desc("editted")])
+
+
+@merged_cached_query
+def get_edited(sr, user=None, include_links=True, include_comments=True):
+    sr_ids = moderated_srids(sr, user)
+    queries = []
+
+    if include_links:
+        queries.append(get_edited_links)
+    if include_comments:
+        queries.append(get_edited_comments)
+    return [query(sr_id) for sr_id, query in itertools.product(sr_ids, queries)]
+
 
 def moderated_srids(sr, user):
     if isinstance(sr, (ModContribSR, MultiReddit)):
@@ -524,24 +557,37 @@ def get_liked(user):
 def get_disliked(user):
     return rel_query(vote_rel, user, '-1')
 
-@cached_query(UserQueryCache, sort=[desc('action_date')])
+@cached_query(UserQueryCache)
 def get_hidden_links(user_id):
-    return
+    return FakeQuery(sort=[desc("action_date")])
 
 def get_hidden(user):
     return get_hidden_links(user)
 
-@cached_query(UserQueryCache, sort=[desc('action_date')])
+@cached_query(UserQueryCache)
+def get_categorized_saved_links(user_id, sr_id, category):
+    return FakeQuery(sort=[desc("action_date")])
+
+@cached_query(UserQueryCache)
+def get_categorized_saved_comments(user_id, sr_id, category):
+    return FakeQuery(sort=[desc("action_date")])
+
+@cached_query(UserQueryCache)
 def get_saved_links(user_id, sr_id):
-    return
+    return FakeQuery(sort=[desc("action_date")])
 
-@cached_query(UserQueryCache, sort=[desc('action_date')])
+@cached_query(UserQueryCache)
 def get_saved_comments(user_id, sr_id):
-    return
+    return FakeQuery(sort=[desc("action_date")])
 
-def get_saved(user, sr_id=None):
+def get_saved(user, sr_id=None, category=None):
     sr_id = sr_id or 'none'
-    queries = [get_saved_links(user, sr_id), get_saved_comments(user, sr_id)]
+    if not category:
+        queries = [get_saved_links(user, sr_id),
+                   get_saved_comments(user, sr_id)]
+    else:
+        queries = [get_categorized_saved_links(user, sr_id, category),
+                   get_categorized_saved_comments(user, sr_id, category)]
     return MergedCachedQuery(queries)
 
 @cached_srrel_query
@@ -675,6 +721,9 @@ def set_promote_status(link, promote_status):
     link.promote_status = promote_status
     link._commit()
 
+    text = "set promote status to '%s'" % PROMOTE_STATUS.name[promote_status]
+    PromotionLog.add(link, text)
+
 
 def _promoted_link_query(user_id, status):
     STATUS_CODES = {'unpaid': PROMOTE_STATUS.unpaid,
@@ -685,7 +734,7 @@ def _promoted_link_query(user_id, status):
                                  PROMOTE_STATUS.pending,
                                  PROMOTE_STATUS.finished)}
 
-    q = Link._query(Link.c.sr_id == get_promote_srid(),
+    q = Link._query(Link.c.sr_id == Subreddit.get_promote_srid(),
                     Link.c._spam == (True, False),
                     Link.c._deleted == (True, False),
                     Link.c.promote_status == STATUS_CODES[status],
@@ -745,6 +794,25 @@ def get_all_accepted_links():
     return _promoted_link_query(None, 'accepted')
 
 
+@cached_query(UserQueryCache)
+def get_underdelivered_campaigns():
+    return FakeQuery(sort=[desc("_date")])
+
+
+def set_underdelivered_campaigns(campaigns):
+    campaigns = tup(campaigns)
+    with CachedQueryMutator() as m:
+        q = get_underdelivered_campaigns()
+        m.insert(q, campaigns)
+
+
+def unset_underdelivered_campaigns(campaigns):
+    campaigns = tup(campaigns)
+    with CachedQueryMutator() as m:
+        q = get_underdelivered_campaigns()
+        m.delete(q, campaigns)
+
+
 @merged_cached_query
 def get_promoted_links(user_id):
     queries = [get_unpaid_links(user_id), get_unapproved_links(user_id),
@@ -761,14 +829,63 @@ def get_all_promoted_links():
     return queries
 
 
-@cached_query(SubredditQueryCache, sort=[desc("date")], filter_fn=filter_thing)
+@cached_query(SubredditQueryCache, filter_fn=filter_thing)
 def get_all_gilded_comments():
-    return
+    return FakeQuery(sort=[desc("date")])
 
 
-@cached_query(SubredditQueryCache, sort=[desc("date")], filter_fn=filter_thing)
+@cached_query(SubredditQueryCache, filter_fn=filter_thing)
+def get_all_gilded_links():
+    return FakeQuery(sort=[desc("date")])
+
+
+@merged_cached_query
+def get_all_gilded():
+    return [get_all_gilded_comments(), get_all_gilded_links()]
+
+
+@cached_query(SubredditQueryCache, filter_fn=filter_thing)
 def get_gilded_comments(sr_id):
-    return
+    return FakeQuery(sort=[desc("date")])
+
+
+@cached_query(SubredditQueryCache, filter_fn=filter_thing)
+def get_gilded_links(sr_id):
+    return FakeQuery(sort=[desc("date")])
+
+
+@merged_cached_query
+def get_gilded(sr_ids):
+    queries = [get_gilded_links, get_gilded_comments]
+    return [query(sr_id)
+            for sr_id, query in itertools.product(tup(sr_ids), queries)]
+
+
+@cached_query(UserQueryCache, filter_fn=filter_thing)
+def get_gilded_user_comments(user_id):
+    return FakeQuery(sort=[desc("date")])
+
+
+@cached_query(UserQueryCache, filter_fn=filter_thing)
+def get_gilded_user_links(user_id):
+    return FakeQuery(sort=[desc("date")])
+
+
+@merged_cached_query
+def get_gilded_users(user_ids):
+    queries = [get_gilded_user_links, get_gilded_user_comments]
+    return [query(user_id)
+            for user_id, query in itertools.product(tup(user_ids), queries)]
+
+
+@cached_query(UserQueryCache, filter_fn=filter_thing)
+def get_user_gildings(user_id):
+    return FakeQuery(sort=[desc("date")])
+
+
+@merged_cached_query
+def get_gilded_user(user):
+    return [get_gilded_user_comments(user), get_gilded_user_links(user)]
 
 
 def add_queries(queries, insert_items=None, delete_items=None, foreground=False):
@@ -847,6 +964,38 @@ def new_link(link):
     amqp.add_item('new_link', link._fullname)
 
 
+def add_to_commentstree_q(comment):
+    if utils.to36(comment.link_id) in g.live_config["fastlane_links"]:
+        amqp.add_item('commentstree_fastlane_q', comment._fullname)
+    elif g.shard_commentstree_queues:
+        amqp.add_item('commentstree_%d_q' % (comment.link_id % 10),
+                      comment._fullname)
+    else:
+        amqp.add_item('commentstree_q', comment._fullname)
+
+
+def update_comment_notifications(comment, inbox_rels, mutator):
+    is_visible = not comment._deleted and not comment._spam
+
+    for inbox_rel in tup(inbox_rels):
+        inbox_owner = inbox_rel._thing1
+        if inbox_rel._name == "inbox":
+            query = get_inbox_comments(inbox_owner)
+        elif inbox_rel._name == "selfreply":
+            query = get_inbox_selfreply(inbox_owner)
+        else:
+            raise ValueError("wtf is " + inbox_rel._name)
+
+        # mentions happen in butler_q
+
+        if is_visible:
+            mutator.insert(query, [inbox_rel])
+        else:
+            mutator.delete(query, [inbox_rel])
+
+        set_unread(comment, inbox_owner, unread=is_visible, mutator=mutator)
+
+
 def new_comment(comment, inbox_rels):
     author = Account._byID(comment.author_id)
     job = [get_comments(author, 'new', 'all'),
@@ -869,17 +1018,7 @@ def new_comment(comment, inbox_rels):
                 m.insert(get_spam_filtered_comments(sr), [comment])
 
             amqp.add_item('new_comment', comment._fullname)
-
-            if utils.to36(comment.link_id) in g.live_config["fastlane_links"]:
-                amqp.add_item('commentstree_fastlane_q', comment._fullname)
-            elif g.shard_commentstree_queues:
-                amqp.add_item('commentstree_%d_q' % (comment.link_id % 10),
-                              comment._fullname)
-            else:
-                amqp.add_item('commentstree_q', comment._fullname)
-
-            if not g.amqp_host:
-                add_comments([comment])
+            add_to_commentstree_q(comment)
 
         job_dict = { job_key: comment }
         add_queries(job, **job_dict)
@@ -888,24 +1027,11 @@ def new_comment(comment, inbox_rels):
         # r2.lib.db.queries.run_new_comments (to minimise lock contention)
 
         if inbox_rels:
-            for inbox_rel in tup(inbox_rels):
-                inbox_owner = inbox_rel._thing1
-                if inbox_rel._name == "inbox":
-                    query = get_inbox_comments(inbox_owner)
-                elif inbox_rel._name == "selfreply":
-                    query = get_inbox_selfreply(inbox_owner)
-                else:
-                    raise ValueError("wtf is " + inbox_rel._name)
+            update_comment_notifications(comment, inbox_rels, mutator=m)
 
-                # mentions happen in butler_q
 
-                if not comment._deleted:
-                    m.insert(query, [inbox_rel])
-                else:
-                    m.delete(query, [inbox_rel])
-
-                set_unread(comment, inbox_owner,
-                           unread=not comment._deleted, mutator=m)
+def delete_comment(comment):
+    add_to_commentstree_q(comment)
 
 
 def new_subreddit(sr):
@@ -919,9 +1045,6 @@ def new_vote(vote, foreground=False, timer=None):
 
     if timer is None:
         timer = SimpleSillyStub()
-
-    if not isinstance(item, (Link, Comment)):
-        return
 
     if vote.valid_thing and not item._spam and not item._deleted:
         sr = item.subreddit_slow
@@ -967,26 +1090,40 @@ def new_vote(vote, foreground=False, timer=None):
                 m.delete(get_liked(user), [vote])
                 m.delete(get_disliked(user), [vote])
 
-def new_message(message, inbox_rels):
+
+def new_message(message, inbox_rels, add_to_sent=True, update_modmail=True):
     from r2.lib.comment_tree import add_message
 
     from_user = Account._byID(message.author_id)
-    for inbox_rel in tup(inbox_rels):
-        to = inbox_rel._thing1
 
-        with CachedQueryMutator() as m:
+    # check if the from_user is exempt from ever adding to sent
+    if not from_user.update_sent_messages:
+        add_to_sent = False
+
+    update_recipient = False
+    add_to_user = None
+
+    with CachedQueryMutator() as m:
+        if add_to_sent:
             m.insert(get_sent(from_user), [message])
 
-            # moderator message
+        for inbox_rel in tup(inbox_rels):
+            to = inbox_rel._thing1
+
             if isinstance(inbox_rel, ModeratorInbox):
                 m.insert(get_subreddit_messages(to), [inbox_rel])
-            # personal message
+                update_modmail &= True
             else:
                 m.insert(get_inbox_messages(to), [inbox_rel])
+                update_recipient = True
+                # make sure we add this message to the user's inbox
+                add_to_user = to
 
             set_unread(message, to, unread=True, mutator=m)
 
-    add_message(message)
+    amqp.add_item('new_message', message._fullname)
+    add_message(message, update_recipient=update_recipient,
+                update_modmail=update_modmail, add_to_user=add_to_user)
 
 def set_unread(messages, to, unread, mutator=None):
     # Maintain backwards compatability
@@ -1027,6 +1164,85 @@ def set_unread(messages, to, unread, mutator=None):
 
     if not mutator:
         m.send()
+
+
+def unread_handler(things, user, unread):
+    """Given a user and Things of varying types, set their unread state."""
+    sr_messages = collections.defaultdict(list)
+    comments = []
+    messages = []
+    # Group things by subreddit or type
+    for thing in things:
+        if isinstance(thing, Message):
+            if getattr(thing, 'sr_id', False):
+                sr_messages[thing.sr_id].append(thing)
+            else:
+                messages.append(thing)
+        else:
+            comments.append(thing)
+
+    if sr_messages:
+        mod_srs = Subreddit.reverse_moderator_ids(user)
+        srs = Subreddit._byID(sr_messages.keys())
+    else:
+        mod_srs = []
+
+    # Batch set items as unread
+    for sr_id, things in sr_messages.items():
+        # Remove the item(s) from the user's inbox
+        set_unread(things, user, unread)
+        if sr_id in mod_srs:
+            # Only moderators can change the read status of that
+            # message in the modmail inbox
+            sr = srs[sr_id]
+            set_unread(things, sr, unread)
+    if comments:
+        set_unread(comments, user, unread)
+    if messages:
+        set_unread(messages, user, unread)
+
+
+def unnotify(thing, possible_recipients=None):
+    """Given a Thing, remove any notifications to possible recipients for it.
+
+    `possible_recipients` is a list of account IDs to unnotify. If not passed,
+    deduce all possible recipients and remove their notifications.
+    """
+    from r2.lib import butler
+
+    if not possible_recipients:
+        possible_recipients = Inbox.possible_recipients(thing)
+
+    if not possible_recipients:
+        return
+
+    accounts = Account._byID(
+        possible_recipients,
+        return_dict=False,
+        ignore_missing=True,
+    )
+
+    if isinstance(thing, Comment):
+        rels = Inbox._fast_query(
+            accounts,
+            thing,
+            ("inbox", "selfreply", "mention"),
+        )
+
+        replies, mentions = utils.partition(
+            lambda r: r._name == "mention",
+            filter(None, rels.values()),
+        )
+
+        for mention in mentions:
+            butler.remove_mention_notification(mention)
+
+        replies = list(replies)
+        if replies:
+            with CachedQueryMutator() as m:
+                update_comment_notifications(thing, replies, mutator=m)
+    else:
+        raise ValueError("Unable to unnotify thing of type: %r" % thing)
 
 
 def changed(things, boost_only=False):
@@ -1100,10 +1316,12 @@ def delete(things):
             query_cache_deletes.append((get_spam_filtered_links(sr), links))
             query_cache_deletes.append((get_unmoderated_links(sr_id),
                                             links))
+            query_cache_deletes.append((get_edited_links(sr_id), links))
         if comments:
             query_cache_deletes.append((get_spam_comments(sr), comments))
             query_cache_deletes.append((get_spam_filtered_comments(sr),
                                         comments))
+            query_cache_deletes.append((get_edited_comments(sr), comments))
 
     for author_id, a_things in by_author.iteritems():
         author = authors[author_id]
@@ -1134,6 +1352,17 @@ def delete(things):
         for q, deletes in query_cache_deletes:
             m.delete(q, deletes)
     changed(things)
+
+
+def edit(thing):
+    if isinstance(thing, Link):
+        query = get_edited_links
+    elif isinstance(thing, Comment):
+        query = get_edited_comments
+
+    with CachedQueryMutator() as m:
+        m.delete(query(thing.sr_id), [thing])
+        m.insert(query(thing.sr_id), [thing])
 
 
 def ban(things, filtered=True):
@@ -1414,31 +1643,28 @@ def queue_vote(user, thing, dir, ip, vote_info=None,
     g.cache.set(key, '1' if dir is True else '0' if dir is None else '-1')
     # queue the vote to be stored unless told not to
     if store:
-        if g.amqp_host:
-            if isinstance(thing, Link):
-                if thing._id36 in g.live_config["fastlane_links"]:
-                    qname = vote_fastlane_q
-                else:
-                    if g.shard_link_vote_queues:
-                        qname = "vote_link_%s_q" % str(thing.sr_id)[-1]
-                    else:
-                        qname = vote_link_q
-
-            elif isinstance(thing, Comment):
-                if utils.to36(thing.link_id) in g.live_config["fastlane_links"]:
-                    qname = vote_fastlane_q
-                else:
-                    qname = vote_comment_q
+        if isinstance(thing, Link):
+            if thing._id36 in g.live_config["fastlane_links"]:
+                qname = vote_fastlane_q
             else:
-                log.warning("%s tried to vote on %r. that's not a link or comment!",
-                            user, thing)
-                return
+                if g.shard_link_vote_queues:
+                    qname = "vote_link_%s_q" % str(thing.sr_id)[-1]
+                else:
+                    qname = vote_link_q
 
-            amqp.add_item(qname,
-                          pickle.dumps((user._id, thing._fullname,
-                                        dir, ip, vote_info, cheater)))
+        elif isinstance(thing, Comment):
+            if utils.to36(thing.link_id) in g.live_config["fastlane_links"]:
+                qname = vote_fastlane_q
+            else:
+                qname = vote_comment_q
         else:
-            handle_vote(user, thing, dir, ip, vote_info)
+            log.warning("%s tried to vote on %r. that's not a link or comment!",
+                        user, thing)
+            return
+
+        amqp.add_item(qname,
+                      pickle.dumps((user._id, thing._fullname,
+                                    dir, ip, vote_info, cheater)))
 
 def prequeued_vote_key(user, item):
     return 'registered_vote_%s_%s' % (user._id, item._fullname)
@@ -1452,26 +1678,18 @@ def get_likes(user, items):
     # check the prequeued_vote_keys
     keys = {}
     for item in items:
-        if (user, item) in res:
-            continue
-
-        key = prequeued_vote_key(user, item)
-        keys[key] = (user, item)
+        # we can only vote on links and comments
+        if isinstance(item, (Comment, Link)):
+            key = prequeued_vote_key(user, item)
+            keys[key] = (user, item)
+        else:
+            res[(user, item)] = None
     if keys:
         r = g.cache.get_multi(keys.keys())
         for key, v in r.iteritems():
             res[keys[key]] = (True if v == '1'
                               else False if v == '-1'
                               else None)
-
-    for item in items:
-        # already retrieved above
-        if (user, item) in res:
-            continue
-
-        # we can only vote on links and comments
-        if not isinstance(item, (Link, Comment)):
-            res[(user, item)] = None
 
     likes = Vote.likes(user, [i for i in items if (user, i) not in res])
 
@@ -1519,6 +1737,9 @@ def handle_vote(user, thing, dir, ip, vote_info,
             #update sup listings
             sup.add_update(user, 'commented')
 
+    else:
+        raise NotImplementedError
+
     timer.intermediate("sup")
 
     for timestamp in timestamps:
@@ -1563,6 +1784,21 @@ def process_votes(qname, limit=0):
             update_comment_votes([votee])
             timer.intermediate("update_comment_votes")
 
+        stats.simple_event('vote.total')
+        if cheater:
+            stats.simple_event('vote.cheater')
         timer.flush()
 
     amqp.consume_items(qname, _handle_vote, verbose = False)
+
+
+def consume_mark_all_read():
+    @g.stats.amqp_processor('markread_q')
+    def process_mark_all_read(msg):
+        user = Account._by_fullname(msg.body)
+        inbox_fullnames = get_unread_inbox(user)
+        for inbox_chunk in in_chunks(inbox_fullnames, size=100):
+            things = Thing._by_fullname(inbox_chunk, return_dict=False)
+            unread_handler(things, user, unread=False)
+
+    amqp.consume_items('markread_q', process_mark_all_read)

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 """
@@ -193,17 +193,23 @@ def get_time_points(interval, start_time=None, stop_time=None):
 
     """
 
+    def truncate_datetime(dt):
+        dt = dt.replace(minute=0, second=0, microsecond=0)
+        if interval in ("day", "month"):
+            dt = dt.replace(hour=0)
+        if interval == "month":
+            dt = dt.replace(day=1)
+        return dt
+
     if start_time and stop_time:
         start_time, stop_time = sorted([start_time, stop_time])
+        # truncate stop_time to an actual traffic time point
+        stop_time = truncate_datetime(stop_time)
     else:
         # the stop time is the most recent slice-time; get this by truncating
         # the appropriate amount from the current time
         stop_time = datetime.datetime.utcnow()
-        stop_time = stop_time.replace(minute=0, second=0, microsecond=0)
-        if interval in ("day", "month"):
-            stop_time = stop_time.replace(hour=0)
-        if interval == "month":
-            stop_time = stop_time.replace(day=1)
+        stop_time = truncate_datetime(stop_time)
 
         # then the start time is easy to work out
         range = time_range_by_interval[interval]
@@ -245,7 +251,7 @@ def make_history_query(cls, interval):
     return time_points, q
 
 
-def top_last_month(cls, key, ids=None):
+def top_last_month(cls, key, ids=None, num=None):
     """Aggregate a listing of the top items (by pageviews) last month.
 
     We use the last month because it's guaranteed to be fully computed and
@@ -264,7 +270,8 @@ def top_last_month(cls, key, ids=None):
     if ids:
         q = q.filter(getattr(cls, key).in_(ids))
     else:
-        q = q.limit(55)
+        num = num or 55
+        q = q.limit(num)
 
     return [(getattr(r, key), (r.unique_count, r.pageview_count))
             for r in q.all()]
@@ -368,6 +375,19 @@ def get_traffic_last_modified():
         return datetime.datetime.min
 
 
+@memoize("missing_traffic", time=60 * 10)
+def get_missing_traffic(start, end):
+    """Check for missing hourly traffic between start and end."""
+
+    # NOTE: start, end must be UTC time without tzinfo
+    time_points = get_time_points('hour', start, end)
+    q = (Session.query(SitewidePageviews.date)
+                .filter(SitewidePageviews.interval == "hour")
+                .filter(SitewidePageviews.date.in_(time_points)))
+    found = [t for (t,) in q]
+    return [t for t in time_points if t not in found]
+
+
 class SitewidePageviews(Base):
     """Pageviews across all areas of the site."""
 
@@ -405,9 +425,14 @@ class PageviewsBySubreddit(Base):
 
     @classmethod
     @memoize_traffic(time=3600 * 6)
-    def top_last_month(cls, srs=None):
-        ids = [sr.name for sr in srs] if srs else None
-        return top_last_month(cls, "subreddit", ids)
+    def top_last_month(cls, num=None):
+        return top_last_month(cls, "subreddit", num=num)
+
+    @classmethod
+    @memoize_traffic(time=3600 * 6)
+    def last_month(cls, srs):
+        ids = [sr.name for sr in srs]
+        return top_last_month(cls, "subreddit", ids=ids)
 
 
 class PageviewsBySubredditAndPath(Base):
@@ -510,7 +535,6 @@ class TargetedClickthroughsByCodename(Base):
         return total_by_codename(cls, codenames)
 
     @classmethod
-    @memoize_traffic(time=3600)
     def campaign_history(cls, codenames, start, stop):
         return campaign_history(cls, codenames, start, stop)
 
@@ -592,7 +616,6 @@ class TargetedImpressionsByCodename(Base):
         return total_by_codename(cls, codenames)
 
     @classmethod
-    @memoize_traffic(time=3600)
     def campaign_history(cls, codenames, start, stop):
         return campaign_history(cls, codenames, start, stop)
 

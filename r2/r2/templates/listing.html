@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -35,17 +35,22 @@
   %endfor
 
   %if thing.nextprev and (thing.prev or thing.next):
-    <p class="nextprev"> ${_("view more:")}&#32;
-    %if thing.prev:
-      ${plain_link(unsafe("&lsaquo; " + _("prev")), thing.prev, _sr_path = (c.site != Sub), rel="nofollow prev")}
-    %endif
-    %if thing.prev and thing.next:
-      <span class="separator"></span>
-    %endif
-    %if thing.next:
-      ${plain_link(unsafe(_("next") + " &rsaquo;"), thing.next,  _sr_path = (c.site != Sub), rel="nofollow next")}
-    %endif
-    </p>
+    <div class="nav-buttons">
+      <span class="nextprev">${_("view more:")}&#32;
+      %if thing.prev:
+        ${plain_link(unsafe("&lsaquo; " + _("prev")), thing.prev, _sr_path = (c.site != Sub), rel="nofollow prev")}
+      %endif
+      %if thing.prev and thing.next:
+        <span class="separator"></span>
+      %endif
+      %if thing.next:
+        ${plain_link(unsafe(_("next") + " &rsaquo;"), thing.next,  _sr_path = (c.site != Sub), rel="nofollow next")}
+      %endif
+      </span>
+      %if thing.next_suggestions:
+        ${thing.next_suggestions}
+      %endif
+    </div>
   %endif
   %if not thing.things:
     <p id="noresults" class="error">${_("there doesn't seem to be anything here")}</p>

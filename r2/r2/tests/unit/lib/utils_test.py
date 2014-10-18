@@ -17,7 +17,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -84,3 +84,25 @@ class TestCanonicalizeEmail(unittest.TestCase):
         # to be byte strings with non-ascii in 'em.
         canonical = utils.canonicalize_email("\xe2\x9c\x93@example.com")
         self.assertEquals(canonical, "\xe2\x9c\x93@example.com")
+
+
+class TestTruncString(unittest.TestCase):
+    def test_empty_string(self):
+        truncated = utils.trunc_string('', 80)
+        self.assertEqual(truncated, '')
+
+    def test_short_enough(self):
+        truncated = utils.trunc_string('short string', 80)
+        self.assertEqual(truncated, 'short string')
+
+    def test_word_breaks(self):
+        truncated = utils.trunc_string('two words', 6)
+        self.assertEqual(truncated, 'two...')
+
+    def test_suffix(self):
+        truncated = utils.trunc_string('two words', 6, '')
+        self.assertEqual(truncated, 'two')
+
+    def test_really_long_words(self):
+        truncated = utils.trunc_string('ThisIsALongWord', 10)
+        self.assertEqual(truncated, 'ThisIsA...')

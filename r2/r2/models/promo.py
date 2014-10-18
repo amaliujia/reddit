@@ -16,47 +16,291 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from collections import namedtuple
 from datetime import datetime, timedelta
 from uuid import uuid1
-import json
 
+from pycassa.types import CompositeType
 from pylons import g, c
+from pylons.i18n import _, N_
 
 from r2.lib import filters
 from r2.lib.cache import sgm
 from r2.lib.db import tdb_cassandra
 from r2.lib.db.thing import Thing, NotFound
 from r2.lib.memoize import memoize
-from r2.lib.utils import Enum, to_datetime
-from r2.models.subreddit import Subreddit
+from r2.lib.utils import Enum, to_datetime, to_date
+from r2.models.subreddit import Subreddit, Frontpage
 
 
 PROMOTE_STATUS = Enum("unpaid", "unseen", "accepted", "rejected",
                       "pending", "promoted", "finished")
 
+class PriorityLevel(object):
+    name = ''
+    _text = N_('')
+    _description = N_('')
+    value = 1   # Values are from 1 (highest) to 100 (lowest)
+    default = False
+    inventory_override = False
+    cpm = True  # Non-cpm is percentage, will fill unsold impressions
 
-@memoize("get_promote_srid")
-def get_promote_srid(name = 'promos'):
-    try:
-        sr = Subreddit._by_name(name, stale=True)
-    except NotFound:
-        sr = Subreddit._new(name = name,
-                            title = "promoted links",
-                            # negative author_ids make this unlisable
-                            author_id = -1,
-                            type = "public", 
-                            ip = '0.0.0.0')
-    return sr._id
+    def __repr__(self):
+        return "<PriorityLevel %s: %s>" % (self.name, self.value)
+
+    @property
+    def text(self):
+        return _(self._text) if self._text else ''
+
+    @property
+    def description(self):
+        return _(self._description) if self._description else ''
+
+
+class HighPriority(PriorityLevel):
+    name = 'high'
+    _text = N_('highest')
+    value = 5
+
+
+class MediumPriority(PriorityLevel):
+    name = 'standard'
+    _text = N_('standard')
+    value = 10
+    default = True
+
+
+class RemnantPriority(PriorityLevel):
+    name = 'remnant'
+    _text = N_('remnant')
+    _description = N_('lower priority, impressions are not guaranteed')
+    value = 20
+    inventory_override = True
+
+
+class HousePriority(PriorityLevel):
+    name = 'house'
+    _text = N_('house')
+    _description = N_('non-CPM, displays in all unsold impressions')
+    value = 30
+    inventory_override = True
+    cpm = False
+
+
+HIGH, MEDIUM, REMNANT, HOUSE = HighPriority(), MediumPriority(), RemnantPriority(), HousePriority()
+PROMOTE_PRIORITIES = {p.name: p for p in (HIGH, MEDIUM, REMNANT, HOUSE)}
+PROMOTE_DEFAULT_PRIORITY = MEDIUM
+
+
+class Location(object):
+    DELIMITER = '-'
+    def __init__(self, country, region=None, metro=None):
+        self.country = country or None
+        self.region = region or None
+        self.metro = metro or None
+
+    def __repr__(self):
+        return '<%s (%s/%s/%s)>' % (self.__class__.__name__, self.country,
+                                    self.region, self.metro)
+
+    def to_code(self):
+        fields = [self.country, self.region, self.metro]
+        return self.DELIMITER.join(i or '' for i in fields)
+
+    @classmethod
+    def from_code(cls, code):
+        country, region, metro = [i or None for i in code.split(cls.DELIMITER)]
+        return cls(country, region, metro)
+
+    def contains(self, other):
+        if not self.country:
+            # self is set of all countries, it includes all possible
+            # values of other.country
+            return True
+        elif not other or not other.country:
+            # self is more specific than other
+            return False
+        else:
+            # both self and other specify a country
+            if self.country != other.country:
+                # countries don't match
+                return False
+            else:
+                # countries match
+                if not self.metro:
+                    # self.metro is set of all metros within country, it
+                    # includes all possible values of other.metro
+                    return True
+                elif not other.metro:
+                    # self is more specific than other
+                    return False
+                else:
+                    return self.metro == other.metro
+
+    def __eq__(self, other):
+        if not isinstance(other, Location):
+            return False
+
+        return (self.country == other.country and
+                self.region == other.region and
+                self.metro == other.metro)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+
+def calc_impressions(bid, cpm_pennies):
+    # bid is in dollars, cpm_pennies is pennies
+    # CPM is cost per 1000 impressions
+    return int(bid / cpm_pennies * 1000 * 100)
 
 
 NO_TRANSACTION = 0
 
+
+class Collection(object):
+    def __init__(self, name, sr_names, description=None):
+        self.name = name
+        self.sr_names = sr_names
+        self.description = description
+
+    @classmethod
+    def by_name(cls, name):
+        return CollectionStorage.get_collection(name)
+
+    @classmethod
+    def get_all(cls):
+        return CollectionStorage.get_all()
+
+    def __repr__(self):
+        return "<%s: %s>" % (self.__class__.__name__, self.name)
+
+
+class CollectionStorage(tdb_cassandra.View):
+    _use_db = True
+    _connection_pool = 'main'
+    _extra_schema_creation_args = {
+        "key_validation_class": tdb_cassandra.UTF8_TYPE,
+        "column_name_class": tdb_cassandra.UTF8_TYPE,
+        "default_validation_class": tdb_cassandra.UTF8_TYPE,
+    }
+    _compare_with = tdb_cassandra.UTF8_TYPE
+    _read_consistency_level = tdb_cassandra.CL.ONE
+    _write_consistency_level = tdb_cassandra.CL.QUORUM
+    SR_NAMES_DELIM = '|'
+
+    @classmethod
+    def set(cls, name, description, srs):
+        rowkey = name
+        columns = {
+            'description': description,
+            'sr_names': cls.SR_NAMES_DELIM.join(sr.name for sr in srs),
+        }
+        cls._set_values(rowkey, columns)
+
+    @classmethod
+    def get_collection(cls, name):
+        if not name:
+            return None
+
+        rowkey = name
+        try:
+            columns = cls._cf.get(rowkey)
+        except tdb_cassandra.NotFoundException:
+            return None
+
+        description = columns['description']
+        sr_names = columns['sr_names'].split(cls.SR_NAMES_DELIM)
+        return Collection(name, sr_names, description=description)
+
+    @classmethod
+    def get_all(cls):
+        ret = []
+        for name, columns in cls._cf.get_range():
+            description = columns['description']
+            sr_names = columns['sr_names'].split(cls.SR_NAMES_DELIM)
+            ret.append(Collection(name, sr_names, description=description))
+        return ret
+
+    def delete(cls, name):
+        rowkey = name
+        cls._cf.remove(rowkey)
+
+
+class Target(object):
+    """Wrapper around either a Collection or a Subreddit name"""
+    def __init__(self, target):
+        if isinstance(target, Collection):
+            self.collection = target
+            self.is_collection = True
+        elif isinstance(target, basestring):
+            self.subreddit_name = target
+            self.is_collection = False
+        else:
+            raise ValueError("target must be a Collection or Subreddit name")
+
+        # defer looking up subreddits, we might only need their names
+        self._subreddits = None
+
+    @property
+    def subreddit_names(self):
+        if self.is_collection:
+            return self.collection.sr_names
+        else:
+            return [self.subreddit_name]
+
+    @property
+    def subreddits_slow(self):
+        if self._subreddits is not None:
+            return self._subreddits
+
+        sr_names = self.subreddit_names
+        srs = Subreddit._by_name(sr_names).values()
+        self._subreddits = srs
+        return srs
+
+    def __eq__(self, other):
+        if self.is_collection != other.is_collection:
+            return False
+
+        return set(self.subreddit_names) == set(other.subreddit_names)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    @property
+    def pretty_name(self):
+        if self.is_collection:
+            return _("collection: %(name)s") % {'name': self.collection.name}
+        elif self.subreddit_name == Frontpage.name:
+            return _("frontpage")
+        else:
+            return "/r/%s" % self.subreddit_name
+
+    def __repr__(self):
+        return "<%s: %s>" % (self.__class__.__name__, self.pretty_name)
+
 class PromoCampaign(Thing):
+    _defaults = dict(
+        priority_name=PROMOTE_DEFAULT_PRIORITY.name,
+        trans_id=NO_TRANSACTION,
+        location_code=None,
+    )
+
+    # special attributes that shouldn't set Thing data attributes because they
+    # have special setters that set other data attributes
+    _derived_attrs = (
+        "location",
+        "priority",
+        "target",
+    )
+
+    SR_NAMES_DELIM = '|'
+    SUBREDDIT_TARGET = "subreddit"
+
     def __getattr__(self, attr):
         val = Thing.__getattr__(self, attr)
         if attr in ('start_date', 'end_date'):
@@ -65,15 +309,62 @@ class PromoCampaign(Thing):
                 val = val.replace(tzinfo=g.tz)
         return val
 
-    @classmethod 
-    def _new(cls, link, sr_name, bid, start_date, end_date):
-        pc = PromoCampaign(link_id=link._id,
-                           sr_name=sr_name,
-                           bid=bid,
-                           start_date=start_date,
-                           end_date=end_date,
-                           trans_id=NO_TRANSACTION,
-                           owner_id=link.author_id)
+    def __setattr__(self, attr, val, make_dirty=True):
+        if attr in self._derived_attrs:
+            object.__setattr__(self, attr, val)
+        else:
+            Thing.__setattr__(self, attr, val, make_dirty=make_dirty)
+
+    def __getstate__(self):
+        """
+        Remove _target before returning object state for pickling.
+
+        Thing objects are pickled for caching. The state of the object is
+        obtained by calling the __getstate__ method. Remove the _target
+        attribute because it may contain Subreddits or other non-trivial objects
+        that shouldn't be included.
+
+        """
+
+        state = self.__dict__
+        if "_target" in state:
+            state = {k: v for k, v in state.iteritems() if k != "_target"}
+        return state
+
+    @classmethod
+    def priority_name_from_priority(cls, priority):
+        if not priority in PROMOTE_PRIORITIES.values():
+            raise ValueError("%s is not a valid priority" % val)
+        return priority.name
+
+    @classmethod
+    def location_code_from_location(cls, location):
+        return location.to_code() if location else None
+
+    @classmethod
+    def unpack_target(cls, target):
+        """Convert a Target into attributes suitable for storage."""
+        sr_names = target.subreddit_names
+        target_sr_names = cls.SR_NAMES_DELIM.join(sr_names)
+        target_name = (target.collection.name if target.is_collection
+                                              else cls.SUBREDDIT_TARGET)
+        return target_sr_names, target_name
+
+    @classmethod
+    def create(cls, link, target, bid, cpm, start_date, end_date, priority,
+             location):
+        pc = PromoCampaign(
+            link_id=link._id,
+            bid=bid,
+            cpm=cpm,
+            start_date=start_date,
+            end_date=end_date,
+            trans_id=NO_TRANSACTION,
+            owner_id=link.author_id,
+        )
+        pc.priority = priority
+        pc.location = location
+        pc.target = target
         pc._commit()
         return pc
 
@@ -85,7 +376,6 @@ class PromoCampaign(Thing):
         '''
         return cls._query(PromoCampaign.c.link_id == link_id, data=True)
 
-
     @classmethod
     def _by_user(cls, account_id):
         '''
@@ -94,6 +384,74 @@ class PromoCampaign(Thing):
         '''
         return cls._query(PromoCampaign.c.owner_id == account_id, data=True)
 
+    @property
+    def ndays(self):
+        return (self.end_date - self.start_date).days
+
+    @property
+    def impressions(self):
+        # deal with pre-CPM PromoCampaigns
+        if not hasattr(self, 'cpm'):
+            return -1
+        elif not self.priority.cpm:
+            return -1
+        return calc_impressions(self.bid, self.cpm)
+
+    @property
+    def priority(self):
+        return PROMOTE_PRIORITIES[self.priority_name]
+
+    @priority.setter
+    def priority(self, priority):
+        self.priority_name = self.priority_name_from_priority(priority)
+
+    @property
+    def location(self):
+        if self.location_code is not None:
+            return Location.from_code(self.location_code)
+        else:
+            return None
+
+    @location.setter
+    def location(self, location):
+        self.location_code = self.location_code_from_location(location)
+
+    @property
+    def target(self):
+        if hasattr(self, "_target"):
+            return self._target
+
+        sr_names = self.target_sr_names.split(self.SR_NAMES_DELIM)
+        if self.target_name == self.SUBREDDIT_TARGET:
+            sr_name = sr_names[0]
+            target = Target(sr_name)
+        else:
+            collection = Collection(self.target_name, sr_names)
+            target = Target(collection)
+
+        self._target = target
+        return target
+
+    @target.setter
+    def target(self, target):
+        self.target_sr_names, self.target_name = self.unpack_target(target)
+
+        # set _target so we don't need to lookup on subsequent access
+        self._target = target
+
+    @property
+    def location_str(self):
+        if not self.location:
+            return ''
+        elif self.location.metro:
+            country = self.location.country
+            region = self.location.region
+            metro_str = (g.locations[country]['regions'][region]
+                         ['metros'][self.location.metro]['name'])
+            return '/'.join([country, region, metro_str])
+        else:
+            return g.locations[self.location.country]['name']
+
     def is_freebie(self):
         return self.trans_id < 0
 
@@ -101,18 +459,20 @@ class PromoCampaign(Thing):
         now = datetime.now(g.tz)
         return self.start_date < now and self.end_date > now
 
-    def update(self, start_date, end_date, bid, sr_name, trans_id, commit=True):
-        self.start_date = start_date
-        self.end_date = end_date
-        self.bid = bid
-        self.sr_name = sr_name
-        self.trans_id = trans_id
-        if commit:
-            self._commit()
-
     def delete(self):
         self._deleted = True
         self._commit()
+
+
+def backfill_campaign_targets():
+    from r2.lib.db.operators import desc
+    from r2.lib.utils import fetch_things2
+
+    q = PromoCampaign._query(sort=desc("_date"), data=True)
+    for campaign in fetch_things2(q):
+        sr_name = campaign.sr_name or Frontpage.name
+        campaign.target = Target(sr_name)
+        campaign._commit()
 
 class PromotionLog(tdb_cassandra.View):
     _use_db = True
@@ -144,106 +504,173 @@ class PromotionLog(tdb_cassandra.View):
         return [t[1] for t in tuples]
 
 
-AdWeight = namedtuple('AdWeight', 'link weight campaign')
-
-
-class LiveAdWeights(object):
-    """Data store for per-subreddit lists of currently running ads"""
-    __metaclass__ = tdb_cassandra.ThingMeta
+class PromotedLinkRoadblock(tdb_cassandra.View):
     _use_db = True
     _connection_pool = 'main'
-    _type_prefix = None
-    _cf_name = None
-    _compare_with = tdb_cassandra.ASCII_TYPE
-    # TTL is 12 hours, to avoid unexpected ads running indefinitely
-    # See note in set_all_from_weights() for more information
-    _ttl = timedelta(hours=12)
-
-    column = 'adweights'
-    cache = g.cache
-    cache_prefix = 'live-adweights-'
-
-    ALL_ADS = 'all'
-    FRONT_PAGE = 'frontpage'
-
-    def __init__(self):
-        raise NotImplementedError()
+    _read_consistency_level = tdb_cassandra.CL.ONE
+    _write_consistency_level = tdb_cassandra.CL.QUORUM
+    _compare_with = CompositeType(
+        tdb_cassandra.DateType(),
+        tdb_cassandra.DateType(),
+    )
 
     @classmethod
-    def to_columns(cls, weights):
-        """Generate a serializable dict representation weights"""
-        return {cls.column: json.dumps(weights)}
+    def _column(cls, start, end):
+        start, end = map(to_datetime, [start, end])
+        return {(start, end): ''}
 
     @classmethod
-    def from_columns(cls, columns):
-        """Given a (serializable) dict, restore the weights"""
-        weights = json.loads(columns.get(cls.column, '[]')) if columns else []
-        # JSON doesn't have the concept of tuples; this restores the return
-        # value to being a list of tuples.
-        return [AdWeight(*w) for w in weights]
+    def _dates_from_key(cls, key):
+        start, end = map(to_date, key)
+        return start, end
 
     @classmethod
-    def _load_multi(cls, sr_ids):
-        skeys = {sr_id: str(sr_id) for sr_id in sr_ids}
-        adweights = cls._cf.multiget(skeys.values(), columns=[cls.column])
-        res = {}
-        for sr_id in sr_ids:
-            # The returned dictionary should include all sr_ids, so
-            # that ad-less SRs are inserted into the cache
-            res[skeys[sr_id]] = adweights.get(sr_id, {})
-        return res
+    def add(cls, sr, start, end):
+        rowkey = sr._id36
+        column = cls._column(start, end)
+        now = datetime.now(g.tz).date()
+        ndays = (to_date(end) - now).days + 7
+        ttl = timedelta(days=ndays).total_seconds()
+        cls._set_values(rowkey, column, ttl=ttl)
 
     @classmethod
-    def get(cls, sr_ids):
-        """Return a dictionary of sr_id -> list of ads for each of sr_ids"""
-        # Mangling: Caller convention is to use empty string for FRONT_PAGE
-        sr_ids = [(sr_id or cls.FRONT_PAGE) for sr_id in sr_ids]
-        adweights = sgm(cls.cache, sr_ids, cls._load_multi,
-                        prefix=cls.cache_prefix, stale=True)
-        results = {sr_id: cls.from_columns(adweights[sr_id])
-                   for sr_id in adweights}
-        if cls.FRONT_PAGE in results:
-            results[''] = results.pop(cls.FRONT_PAGE)
-        return results
+    def remove(cls, sr, start, end):
+        rowkey = sr._id36
+        column = cls._column(start, end)
+        cls._remove(rowkey, column)
 
     @classmethod
-    def get_live_subreddits(cls):
+    def is_roadblocked(cls, sr, start, end):
+        rowkey = sr._id36
+        start, end = map(to_date, [start, end])
+
+        # retrieve columns for roadblocks starting before end
+        try:
+            columns = cls._cf.get(rowkey, column_finish=(to_datetime(end),),
+                                  column_count=tdb_cassandra.max_column_count)
+        except tdb_cassandra.NotFoundException:
+            return False
+
+        for key in columns.iterkeys():
+            rb_start, rb_end = cls._dates_from_key(key)
+
+            # check for overlap, end dates not inclusive
+            if (start < rb_end) and (rb_start < end):
+                return (rb_start, rb_end)
+        return False
+
+    @classmethod
+    def get_roadblocks(cls):
+        ret = []
         q = cls._cf.get_range()
-        results = []
-        empty = {cls.column: '[]'}
-        for sr_id, columns in q:
-            if sr_id in (cls.ALL_ADS, cls.FRONT_PAGE):
-                continue
-            if not columns or columns == empty:
-                continue
-            results.append(int(sr_id))
-        return results
+        rows = list(q)
+        srs = Subreddit._byID36([id36 for id36, columns in rows], data=True)
+        for id36, columns in rows:
+            sr = srs[id36]
+            for key in columns.iterkeys():
+                start, end = cls._dates_from_key(key)
+                ret.append((sr.name, start, end))
+        return ret
+
+
+class PromotionPrices(tdb_cassandra.View):
+    """
+    Price rules:
+    * Location targeting trumps all: Anything targeting a metro gets the global
+      metro price.
+    * Any collection or subreddit with a specified price gets that price
+    * Any collection or subreddit without a specified price gets the global
+      collection or subreddit price
+    * Frontpage gets the global collection price.
+
+    """
+
+    _use_db = True
+    _connection_pool = 'main'
+    _read_consistency_level = tdb_cassandra.CL.ONE
+    _write_consistency_level = tdb_cassandra.CL.ALL
+    _extra_schema_creation_args = {
+        "key_validation_class": tdb_cassandra.UTF8_TYPE,
+        "column_name_class": tdb_cassandra.UTF8_TYPE,
+        "default_validation_class": tdb_cassandra.INT_TYPE,
+    }
 
     @classmethod
-    def set_all_from_weights(cls, all_weights):
-        """Given a dictionary with all ads that should currently be running
-        (where the dictionary keys are the subreddit IDs, and the paired
-        value is the list of ads for that subreddit), update the ad system
-        to use those ads on those subreddits.
+    def _get_components(cls, target, cpm):
+        rowkey = column_name = None
+        column_value = cpm
 
-        Note: Old ads are not cleared out. It is expected that the caller
-        include empty-list entries in `all_weights` for any Subreddits
-        that should be cleared.
+        if isinstance(target, Target):
+            if target.is_collection:
+                rowkey = "COLLECTION"
+                column_name = target.collection.name
+            else:
+                rowkey = "SUBREDDIT"
+                column_name = target.subreddit_name
 
-        """
-        weights = {}
-        all_ads = []
-        for sr_id, sr_ads in all_weights.iteritems():
-            all_ads.extend(sr_ads)
-            weights[str(sr_id)] = cls.to_columns(sr_ads)
-        weights[cls.ALL_ADS] = cls.to_columns(all_ads)
+        if not rowkey or not column_name:
+            raise ValueError("target must be Target")
 
-        cls._cf.batch_insert(weights, ttl=cls._ttl)
-
-        # Prep the cache!
-        cls.cache.set_multi(weights, prefix=cls.cache_prefix)
+        return rowkey, column_name, column_value
 
     @classmethod
-    def clear(cls, sr_id):
-        """Clear ad information from the Subreddit with ID `sr_id`"""
-        cls.set_all_from_weights({sr_id: []})
+    def set_price(cls, target, cpm):
+        rowkey, column_name, column_value = cls._get_components(target, cpm)
+        cls._cf.insert(rowkey, {column_name: column_value})
+
+    @classmethod
+    def get_price(cls, target, location):
+        if location and location.metro:
+            return g.cpm_selfserve_geotarget_metro.pennies
+
+        # check for Frontpage
+        if (isinstance(target, Target) and
+                not target.is_collection and
+                target.subreddit_name == Frontpage.name):
+            return g.cpm_selfserve_collection.pennies
+
+        # check for target specific override price
+        rowkey, column_name, _ = cls._get_components(target, None)
+        try:
+            columns = cls._cf.get(rowkey, columns=[column_name])
+        except tdb_cassandra.NotFoundException:
+            columns = {}
+        if column_name in columns:
+            return columns[column_name]
+
+        # use global price
+        if isinstance(target, Target):
+            if target.is_collection:
+                return g.cpm_selfserve_collection.pennies
+            else:
+                return g.cpm_selfserve.pennies
+
+        raise ValueError("target must be Target")
+
+    @classmethod
+    def get_price_dict(cls):
+        r = {
+            "COLLECTION": {},
+            "SUBREDDIT": {},
+            "METRO": g.cpm_selfserve_geotarget_metro.pennies,
+            "COLLECTION_DEFAULT": g.cpm_selfserve_collection.pennies,
+            "SUBREDDIT_DEFAULT": g.cpm_selfserve.pennies,
+        }
+
+        try:
+            collections = cls._cf.get("COLLECTION")
+        except tdb_cassandra.NotFoundException:
+            collections = {}
+
+        try:
+            subreddits = cls._cf.get("SUBREDDIT")
+        except tdb_cassandra.NotFoundException:
+            subreddits = {}
+
+        for name, cpm in collections.iteritems():
+            r["COLLECTION"][name] = cpm
+
+        for name, cpm in subreddits.iteritems():
+            r["SUBREDDIT"][name] = cpm
+
+        return r

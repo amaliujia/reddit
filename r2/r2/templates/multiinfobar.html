@@ -16,13 +16,13 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2012
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
 <%!
    from r2.lib.strings import strings, Score
-   from r2.lib.pages import WrappedUser, ModList, UserText
+   from r2.lib.pages import WrappedUser, UserText
  %>
 
 <%namespace file="utils.html" import="plain_link, thing_timestamp, text_with_links"/>
@@ -75,6 +75,10 @@
     %if thing.can_edit:
       <div class="gray-buttons settings">
         <button class="edit-description">${_('edit description')}</button>
+
+        %if thing.share_url:
+          <a class="share-in-sr" href="${thing.share_url}">${_('share')} &rsaquo;</a>
+        %endif
       </div>
     %endif
   </div>
@@ -105,5 +109,40 @@
       ${_("a multireddit for")}&#32;${thing_timestamp(thing.multi)}
     </span>
   </div>
-</div>
 
+  <div id="multi-recs" class="recommend-box">
+
+    <div class="recs">
+      <div>
+        <h1>
+          ${_("people also added:")}
+        </h1>
+      </div>
+      <ul class="recommendations"></ul>
+      <span class="more">${_("more suggestions")}</span>
+    </div>
+
+    <div class="endoflist">
+      <h1>${_("no more suggestions!")}</h1>
+      <div class="heading">${_("would you like to...")}</div>
+      <ul>
+        <li>
+          <a href="/r/ModeratorDuck/wiki/subreddit_classification" target="_blank">
+            ${_("check out subreddits by category")}
+          </a>
+        </li>
+        <li>
+          <a href="/r/random" target="_blank">
+            ${_("explore a random subreddit")}
+          </a>
+        </li>
+        <li>
+          <a class="reset">
+            ${_("see the suggestions again")}
+          </a>
+        </li>
+      </ul>
+    </div>
+
+  </div>
+</div>

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -36,7 +36,6 @@ extension_mapping = {
     "rss": ("xml", "text/xml; charset=UTF-8"),
     "xml": ("xml", "text/xml; charset=UTF-8"),
     "js": ("js", "text/javascript; charset=UTF-8"),
-    "wired": ("wired", "text/javascript; charset=UTF-8"),
     "embed": ("htmllite", "text/javascript; charset=UTF-8"),
     "mobile": ("mobile", "text/html; charset=UTF-8"),
     "png": ("png", "image/png"),
@@ -51,6 +50,7 @@ extension_mapping = {
 }
 
 API_TYPES = ('api', 'json')
+RSS_TYPES = ('rss', 'xml')
 
 def set_extension(environ, ext):
     environ["extension"] = ext

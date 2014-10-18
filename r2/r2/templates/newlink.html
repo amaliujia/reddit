@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,6 +24,7 @@
    from r2.lib.strings import strings
    from r2.lib.pages import SubredditSelector, UserText
    from r2.lib.template_helpers import add_sr
+   from r2.lib.filters import safemarkdown
 %>
 
 <%namespace file="utils.html" import="error_field, submit_form, _a_buffered, text_with_links"/>
@@ -35,6 +36,7 @@
   else:
     sr = _("reddit")
 %>
+
 <h1>${unsafe(_("submit to %(sr)s") % dict(sr=sr))}</h1>
 
 <%utils:submit_form onsubmit="return post_form(this, 'submit', linkstatus, null, true)" 
@@ -103,17 +105,25 @@ ${thing.formtabs_menu}
   </%utils:round_field>
 </div>
 
-%if c.user.gold:
-  <div class="spacer">
-    <%utils:round_field title="${_('options')}" css_class="gold-accent">
-      <input class="nomargin" type="checkbox" checked="checked" name="sendreplies" id="sendreplies" data-send-checked="true"/>
-      <label for="sendreplies">
-        ${_("send replies to my inbox")}
-      </label>
-      &#32;<span class="little gray">(${_("beta")})</span>
-    </%utils:round_field>
-  </div>
-%endif
+<div class="spacer">
+    <div class="submit_text roundfield">
+        <h1>${unsafe(_('submitting to %(sr)s') % dict(sr='/r/<span class="sr"></span>'))}</h1>
+        <span class="content">
+            %if thing.default_sr and thing.default_sr.submit_text:
+                ${unsafe(safemarkdown(thing.default_sr.submit_text))}
+            %endif
+        </span>
+    </div>
+</div>
+
+<div class="spacer">
+  <%utils:round_field title="${_('options')}">
+    <input class="nomargin" type="checkbox" checked="checked" name="sendreplies" id="sendreplies" data-send-checked="true"/>
+    <label for="sendreplies">
+      ${_("send replies to my inbox")}
+    </label>
+  </%utils:round_field>
+</div>
 
 ${thing.captcha}
     

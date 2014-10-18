@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -32,12 +32,14 @@ from pycassa import ColumnFamily
 from pycassa.cassandra.ttypes import ConsistencyLevel
 from pycassa.cassandra.ttypes import NotFoundException as CassandraNotFound
 
-from r2.lib.contrib import memcache
 from r2.lib.utils import in_chunks, prefix_keys, trace
 from r2.lib.hardcachebackend import HardCacheBackend
 
 from r2.lib.sgm import sgm # get this into our namespace so that it's
                            # importable from us
+
+# This is for use in the health controller
+_CACHE_SERVERS = set()
 
 class NoneResult(object): pass
 
@@ -59,36 +61,6 @@ class CacheUtils(object):
 
     def get_multi(self, keys, prefix='', **kw):
         return prefix_keys(keys, prefix, lambda k: self.simple_get_multi(k, **kw))
-
-class PyMemcache(CacheUtils, memcache.Client):
-    """We still use our patched python-memcache to talk to the
-       permacaches for legacy reasons"""
-    simple_get_multi = memcache.Client.get_multi
-
-    def __init__(self, servers):
-        memcache.Client.__init__(self, servers, pickleProtocol = 1)
-
-    def set_multi(self, keys, prefix='', time=0):
-        new_keys = {}
-        for k,v in keys.iteritems():
-            new_keys[str(k)] = v
-        memcache.Client.set_multi(self, new_keys, key_prefix = prefix,
-                                  time = time)
-
-    def get(self, key, default=None):
-        r = memcache.Client.get(self, key)
-        if r is None: return default
-        return r
-
-    def set(self, key, val, time=0):
-        memcache.Client.set(self, key, val, time = time)
-
-    def delete(self, key, time=0):
-        memcache.Client.delete(self, key, time=time)
-
-    def delete_multi(self, keys, prefix='', time=0):
-        memcache.Client.delete_multi(self, keys, time = time,
-                                     key_prefix = prefix)
 
 class CMemcache(CacheUtils):
     def __init__(self,
@@ -113,6 +85,8 @@ class CMemcache(CacheUtils):
             self.clients.put(client)
 
         self.min_compress_len = min_compress_len
+
+        _CACHE_SERVERS.update(servers)
 
     def get(self, key, default = None):
         with self.clients.reserve() as mc:
@@ -325,6 +299,76 @@ class LocalCache(dict, CacheUtils):
 
     def __repr__(self):
         return "<LocalCache(%d)>" % (len(self),)
+
+
+class TransitionalCache(CacheUtils):
+    """A cache "chain" for moving keys to a new cluster live.
+
+    `original_cache` is the cache chain previously in use (this'll frequently
+    be `g.cache` since it's the catch-all for most things) and
+    `replacement_cache` is the new place for the keys using this chain to live.
+
+    To use this cache chain, do three separate deployments as follows:
+
+        * start dual-writing to the new pool by putting this chain in place
+          with `read_original=True`.
+        * cut reads over to the new pool after it is sufficiently heated up by
+          deploying `read_original=False`.
+        * remove this cache chain entirely and replace it with
+          `replacement_cache`.
+
+    This ensures that at any point, all apps regardless of their position in
+    the push order will have a consistent view of the data in the cache pool as
+    much as is possible.
+
+    """
+
+    def __init__(self, original_cache, replacement_cache, read_original):
+        self.original = original_cache
+        self.replacement = replacement_cache
+        self.read_original = read_original
+
+    @property
+    def stats(self):
+        if self.read_original:
+            return self.original.stats
+        else:
+            return self.replacement.stats
+
+    def make_get_fn(fn_name):
+        def transitional_cache_get_fn(self, *args, **kwargs):
+            if self.read_original:
+                return getattr(self.original, fn_name)(*args, **kwargs)
+            else:
+                return getattr(self.replacement, fn_name)(*args, **kwargs)
+        return transitional_cache_get_fn
+
+    get = make_get_fn("get")
+    get_multi = make_get_fn("get_multi")
+    simple_get_multi = make_get_fn("simple_get_multi")
+
+    def make_set_fn(fn_name):
+        def transitional_cache_set_fn(self, *args, **kwargs):
+            getattr(self.original, fn_name)(*args, **kwargs)
+            getattr(self.replacement, fn_name)(*args, **kwargs)
+        return transitional_cache_set_fn
+
+    add = make_set_fn("add")
+    set = make_set_fn("set")
+    append = make_set_fn("append")
+    prepend = make_set_fn("prepend")
+    replace = make_set_fn("replace")
+    set_multi = make_set_fn("set_multi")
+    add = make_set_fn("add")
+    add_multi = make_set_fn("add_multi")
+    incr = make_set_fn("incr")
+    incr_multi = make_set_fn("incr_multi")
+    decr = make_set_fn("decr")
+    delete = make_set_fn("delete")
+    delete_multi = make_set_fn("delete_multi")
+    flush_all = make_set_fn("flush_all")
+    reset = make_set_fn("reset")
+
 
 class CacheChain(CacheUtils, local):
     def __init__(self, caches, cache_negative_results=False):
@@ -733,7 +777,7 @@ class CassandraCache(CacheUtils):
                 if val != NoneResult:
                     ret[key] = self.cf.insert('%s%s' % (prefix, key),
                                               {'value': pickle.dumps(val)},
-                                              ttl = time)
+                                              ttl = time or None)
 
         self._warm(keys.keys())
 

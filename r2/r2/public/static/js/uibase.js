@@ -13,7 +13,7 @@ r.ui.Collapse = function(el, target, key) {
     r.ui.Base.call(this, el)
     this.target = target
     this.key = 'ui.collapse.' + key
-    this.isCollapsed = store.get(this.key) == true
+    this.isCollapsed = store.safeGet(this.key) == true
     this.$el.click($.proxy(this, 'toggle', null, false))
     this.toggle(this.isCollapsed, true)
 }
@@ -33,7 +33,7 @@ r.ui.Collapse.prototype = {
         }
 
         this.isCollapsed = collapsed
-        store.set(this.key, collapsed)
+        store.safeSet(this.key, collapsed)
         this.update()
     },
 
@@ -90,11 +90,10 @@ r.ui.Summarize.prototype = {
         }
         e.preventDefault()
     }
-};
-
-r.ui.collapseListingChooser = function() {
-    if (store.get('ui.collapse.listingchooser') == true) {
-        $('body').addClass('listing-chooser-collapsed')
-    }
 }
 
+r.ui.setSavedFullname = function(fullname) {
+    var $el = $('.id-' + fullname).find('.save-button a').first()
+    $el.text(r._('unsave'))
+    $el.thing().addClass('saved')
+}

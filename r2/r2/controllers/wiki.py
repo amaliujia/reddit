@@ -16,13 +16,13 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from pylons import request, g, c
-from pylons.controllers.util import redirect_to
 from reddit_base import RedditController
+from r2.controllers.oauth2 import require_oauth2_scope
 from r2.lib.utils import url_links_builder
 from reddit_base import paginated_listing
 from r2.models.wiki import (WikiPage, WikiRevision, ContentLengthError,
@@ -37,6 +37,8 @@ from r2.lib.template_helpers import join_urls
 from r2.lib.validator import (
     nop,
     validate,
+    VAdmin,
+    VBoolean,
     VExistingUname,
     VInt,
     VMarkdown,
@@ -66,7 +68,7 @@ from r2.lib.template_helpers import add_sr
 from r2.lib.db import tdb_cassandra
 from r2.models.listing import WikiRevisionListing
 from r2.lib.pages.things import default_thing_wrapper
-from r2.lib.pages import BoringPage
+from r2.lib.pages import BoringPage, CssError
 from reddit_base import base_listing
 from r2.models import IDBuilder, LinkListing, DefaultSR
 from r2.lib.merge import ConflictException, make_htmldiff
@@ -80,18 +82,23 @@ from r2.lib.errors import reddit_http_error
 import json
 
 page_descriptions = {'config/stylesheet':_("This page is the subreddit stylesheet, changes here apply to the subreddit css"),
+                     'config/submit_text':_("The contents of this page appear on the submit page"),
                      'config/sidebar':_("The contents of this page appear on the subreddit sidebar"),
                      'config/description':_("The contents of this page appear in the public subreddit description")}
 
 ATTRIBUTE_BY_PAGE = {"config/sidebar": "description",
+                     "config/submit_text": "submit_text",
                      "config/description": "public_description"}
 RENDERERS_BY_PAGE = {"config/sidebar": "reddit",
+                     "config/submit_text": "reddit",
                      "config/description": "reddit",
                      "config/stylesheet": "stylesheet"}
 
 class WikiController(RedditController):
     allow_stylesheets = True
 
+    @require_oauth2_scope("wikiread")
+    @api_doc(api_section.wiki, uri='/wiki/{page}', uses_site=True)
     @validate(pv=VWikiPageAndVersion(('page', 'v', 'v2'),
                                      required=False,
                                      restricted=False,
@@ -99,6 +106,12 @@ class WikiController(RedditController):
               page_name=VWikiPageName('page',
                                       error_on_name_normalized=True))
     def GET_wiki_page(self, pv, page_name):
+        """Return the content of a wiki page
+
+        If `v` is given, show the wiki page as it was at that version
+        If both `v` and `v2` are given, show a diff of the two
+
+        """
         message = None
 
         if c.errors.get(('PAGE_NAME_NORMALIZED', 'page')):
@@ -152,15 +165,19 @@ class WikiController(RedditController):
                             edit_date=edit_date, page=page.name,
                             renderer=renderer).render()
 
+    @require_oauth2_scope("wikiread")
+    @api_doc(api_section.wiki, uri='/wiki/revisions/{page}', uses_site=True)
     @paginated_listing(max_page_size=100, backend='cassandra')
     @validate(page=VWikiPage(('page'), restricted=False))
     def GET_wiki_revisions(self, num, after, reverse, count, page):
+        """Retrieve a list of revisions of this wiki `page`"""
         revisions = page.get_revisions()
         wikiuser = c.user if c.user_is_loggedin else None
         builder = WikiRevisionBuilder(revisions, user=wikiuser, sr=c.site,
                                       num=num, reverse=reverse, count=count,
                                       after=after, skip=not c.is_wiki_mod,
-                                      wrap=default_thing_wrapper())
+                                      wrap=default_thing_wrapper(),
+                                      page=page)
         listing = WikiRevisionListing(builder).listing()
         return WikiRevisions(listing, page=page.name, may_revise=this_may_revise(page)).render()
 
@@ -200,8 +217,11 @@ class WikiController(RedditController):
         return WikiEdit(content, previous, alert=message, page=wp.name,
                         may_revise=True).render()
 
+    @require_oauth2_scope("wikiread")
+    @api_doc(api_section.wiki, uri='/wiki/revisions', uses_site=True)
     @paginated_listing(max_page_size=100, backend='cassandra')
     def GET_wiki_recent(self, num, after, reverse, count):
+        """Retrieve a list of recently changed wiki pages in this subreddit"""
         revisions = WikiRevision.get_recent(c.site)
         wikiuser = c.user if c.user_is_loggedin else None
         builder = WikiRecentRevisionBuilder(revisions,  num=num, count=count,
@@ -212,18 +232,24 @@ class WikiController(RedditController):
         listing = WikiRevisionListing(builder).listing()
         return WikiRecent(listing).render()
 
+    @require_oauth2_scope("wikiread")
+    @api_doc(api_section.wiki, uri='/wiki/pages', uses_site=True)
     def GET_wiki_listing(self):
+        """Retrieve a list of wiki pages in this subreddit"""
         def check_hidden(page):
-            return this_may_view(page)
+            return page.listed and this_may_view(page)
         pages, linear_pages = WikiPage.get_listing(c.site, filter_check=check_hidden)
         return WikiListing(pages, linear_pages).render()
 
     def GET_wiki_redirect(self, page='index'):
-        return redirect_to(str("%s/%s" % (c.wiki_base_url, page)), _code=301)
+        return self.redirect(str("%s/%s" % (c.wiki_base_url, page)), code=301)
 
+    @require_oauth2_scope("wikiread")
+    @api_doc(api_section.wiki, uri='/wiki/discussions/{page}', uses_site=True)
     @base_listing
     @validate(page=VWikiPage('page', restricted=True))
     def GET_wiki_discussions(self, page, num, after, reverse, count):
+        """Retrieve a list of discussions about this wiki `page`"""
         page_url = add_sr("%s/%s" % (c.wiki_base_url, page.name))
         builder = url_links_builder(page_url, num=num, after=after,
                                     reverse=reverse, count=count)
@@ -231,9 +257,13 @@ class WikiController(RedditController):
         return WikiDiscussions(listing, page=page.name,
                                may_revise=this_may_revise(page)).render()
 
+    @require_oauth2_scope("modwiki")
+    @api_doc(api_section.wiki, uri='/wiki/settings/{page}', uses_site=True)
     @validate(page=VWikiPage('page', restricted=True, modonly=True))
     def GET_wiki_settings(self, page):
-        settings = {'permlevel': page._get('permlevel', 0)}
+        """Retrieve the current permission settings for `page`"""
+        settings = {'permlevel': page._get('permlevel', 0),
+                    'listed': page.listed}
         mayedit = page.get_editor_accounts()
         restricted = (not page.special) and page.restricted
         show_editors = not restricted
@@ -242,18 +272,32 @@ class WikiController(RedditController):
                             restricted=restricted,
                             may_revise=True).render()
 
+    @require_oauth2_scope("modwiki")
+    @api_doc(api_section.wiki, uri='/wiki/settings/{page}', uses_site=True)
     @validate(VModhash(),
               page=VWikiPage('page', restricted=True, modonly=True),
-              permlevel=VInt('permlevel'))
-    def POST_wiki_settings(self, page, permlevel):
+              permlevel=VInt('permlevel'),
+              listed=VBoolean('listed'))
+    def POST_wiki_settings(self, page, permlevel, listed):
+        """Update the permissions and visibility of wiki `page`"""
         oldpermlevel = page.permlevel
         try:
             page.change_permlevel(permlevel)
         except ValueError:
             self.handle_error(403, 'INVALID_PERMLEVEL')
-        description = 'Page: %s, Changed from %s to %s' % (page.name, oldpermlevel, permlevel)
-        ModAction.create(c.site, c.user, 'wikipermlevel',
-                         description=description)
+        if page.listed != listed:
+            page.listed = listed
+            page._commit()
+            verb = 'Relisted' if listed else 'Delisted'
+            description = '%s page %s' % (verb, page.name)
+            ModAction.create(c.site, c.user, 'wikipagelisted',
+                             description=description)
+        if oldpermlevel != permlevel:
+            description = 'Page: %s, Changed from %s to %s' % (
+                page.name, oldpermlevel, permlevel
+            )
+            ModAction.create(c.site, c.user, 'wikipermlevel',
+                             description=description)
         return self.GET_wiki_settings(page=page.name)
 
     def on_validation_error(self, error):
@@ -295,13 +339,15 @@ class WikiController(RedditController):
 
 
 class WikiApiController(WikiController):
+    @require_oauth2_scope("wikiedit")
     @validate(VModhash(),
               pageandprevious=VWikiPageRevise(('page', 'previous'), restricted=True),
               content=nop(('content')),
               page_name=VWikiPageName('page'),
               reason=VPrintable('reason', 256, empty_error=None))
-    @api_doc(api_section.wiki, uri='/api/wiki/edit')
+    @api_doc(api_section.wiki, uri='/api/wiki/edit', uses_site=True)
     def POST_wiki_edit(self, pageandprevious, content, page_name, reason):
+        """Edit a wiki `page`"""
         page, previous = pageandprevious
 
         if not page:
@@ -322,14 +368,14 @@ class WikiApiController(WikiController):
         # None/Undefined and an empty string.  The validators use a default
         # value with both of those cases and would need to be changed.
         # In order to avoid breaking functionality, this was done instead.
-        previous = previous._id if previous else request.post.get('previous')
+        previous = previous._id if previous else request.POST.get('previous')
         try:
             if page.name == 'config/stylesheet':
-                report, parsed = c.site.parse_css(content, verify=False)
-                if report is None:  # g.css_killswitch
+                css_errors, parsed = c.site.parse_css(content, verify=False)
+                if g.css_killswitch:
                     self.handle_error(403, 'STYLESHEET_EDIT_DENIED')
-                if report.errors:
-                    error_items = [x.message for x in sorted(report.errors)]
+                if css_errors:
+                    error_items = [CssError(x).message for x in css_errors]
                     self.handle_error(415, 'SPECIAL_ERRORS', special_errors=error_items)
                 c.site.change_css(content, parsed, previous, reason=reason)
             else:
@@ -342,7 +388,6 @@ class WikiApiController(WikiController):
                 # object. TODO: change this to minimize subreddit get sizes.
                 if page.special:
                     setattr(c.site, ATTRIBUTE_BY_PAGE[page.name], content)
-                    setattr(c.site, "prev_" + ATTRIBUTE_BY_PAGE[page.name] + "_id", str(page.revision))
                     c.site._commit()
 
                 if page.special or c.is_wiki_mod:
@@ -352,14 +397,17 @@ class WikiApiController(WikiController):
             self.handle_error(409, 'EDIT_CONFLICT', newcontent=e.new, newrevision=page.revision, diffcontent=e.htmldiff)
         return json.dumps({})
 
+    @require_oauth2_scope("modwiki")
     @validate(VModhash(),
               VWikiModerator(),
               page=VWikiPage('page'),
               act=VOneOf('act', ('del', 'add')),
               user=VExistingUname('username'))
     @api_doc(api_section.wiki, uri='/api/wiki/alloweditor/{act}',
+             uses_site=True,
              uri_variants=['/api/wiki/alloweditor/%s' % act for act in ('del', 'add')])
     def POST_wiki_allow_editor(self, act, page, user):
+        """Allow/deny `username` to edit this wiki `page`"""
         if not user:
             self.handle_error(404, 'UNKNOWN_USER')
         elif act == 'del':
@@ -370,29 +418,49 @@ class WikiApiController(WikiController):
             self.handle_error(400, 'INVALID_ACTION')
         return json.dumps({})
 
+    @validate(
+        VModhash(),
+        VAdmin(),
+        pv=VWikiPageAndVersion(('page', 'revision')),
+        deleted=VBoolean('deleted'),
+    )
+    def POST_wiki_revision_delete(self, pv, deleted):
+        page, revision = pv
+        if not revision:
+            self.handle_error(400, 'INVALID_REVISION')
+        if deleted and page.revision == str(revision._id):
+            self.handle_error(400, 'REVISION_IS_CURRENT')
+        revision.admin_deleted = deleted
+        revision._commit()
+        return json.dumps({'status': revision.admin_deleted})
+
+    @require_oauth2_scope("modwiki")
     @validate(VModhash(),
               VWikiModerator(),
               pv=VWikiPageAndVersion(('page', 'revision')))
-    @api_doc(api_section.wiki, uri='/api/wiki/hide')
+    @api_doc(api_section.wiki, uri='/api/wiki/hide', uses_site=True)
     def POST_wiki_revision_hide(self, pv):
+        """Toggle the public visibility of a wiki page revision"""
         page, revision = pv
         if not revision:
             self.handle_error(400, 'INVALID_REVISION')
         return json.dumps({'status': revision.toggle_hide()})
 
+    @require_oauth2_scope("modwiki")
     @validate(VModhash(),
               VWikiModerator(),
               pv=VWikiPageAndVersion(('page', 'revision')))
-    @api_doc(api_section.wiki, uri='/api/wiki/revert')
+    @api_doc(api_section.wiki, uri='/api/wiki/revert', uses_site=True)
     def POST_wiki_revision_revert(self, pv):
+        """Revert a wiki `page` to `revision`"""
         page, revision = pv
         if not revision:
             self.handle_error(400, 'INVALID_REVISION')
         content = revision.content
         reason = 'reverted back %s' % timesince(revision.date)
         if page.name == 'config/stylesheet':
-            report, parsed = c.site.parse_css(content)
-            if report.errors:
+            css_errors, parsed = c.site.parse_css(content)
+            if css_errors:
                 self.handle_error(403, 'INVALID_CSS')
             c.site.change_css(content, parsed, prev=None, reason=reason, force=True)
         else:
@@ -403,7 +471,6 @@ class WikiApiController(WikiController):
                 # object. TODO: change this to minimize subreddit get sizes.
                 if page.special:
                     setattr(c.site, ATTRIBUTE_BY_PAGE[page.name], content)
-                    setattr(c.site, "prev_" + ATTRIBUTE_BY_PAGE[page.name] + "_id", page.revision)
                     c.site._commit()
             except ContentLengthError as e:
                 self.handle_error(403, 'CONTENT_LENGTH_ERROR', max_length=e.max_length)
@@ -413,3 +480,4 @@ class WikiApiController(WikiController):
         WikiController.pre(self)
         c.render_style = 'api'
         set_extension(request.environ, 'json')
+

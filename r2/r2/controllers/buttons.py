@@ -16,16 +16,15 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from reddit_base import RedditController
+from reddit_base import RedditController, UnloggedUser
 from r2.lib.pages import (ButtonLite, ButtonDemoPanel, WidgetDemoPanel,
                           Bookmarklets, BoringPage)
 from r2.lib.pages.things import wrap_links
 from r2.models import *
-from r2.lib.utils import tup
 from r2.lib.validator import *
 from pylons import c, request, response
 from pylons.i18n import _
@@ -39,7 +38,7 @@ class ButtonsController(RedditController):
             else:
                 sr = None if isinstance(c.site, FakeSubreddit) else c.site
                 try:
-                    links = tup(Link._by_url(url, sr))
+                    links = Link._by_url(url, sr)
                 except NotFound:
                     pass
 
@@ -80,6 +79,8 @@ class ButtonsController(RedditController):
               newwindow = VBoolean('newwindow', default = False),
               styled = VBoolean('styled', default=True))
     def GET_button_lite(self, buttonimage, title, url, styled, newwindow):
+        c.user = UnloggedUser([c.lang])
+        c.user_is_loggedin = False
         c.render_style = 'js'
 
         if not url:

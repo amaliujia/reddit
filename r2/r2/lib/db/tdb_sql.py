@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -351,12 +351,6 @@ def build_rel_tables():
         rel_types_id[type_id] = rel
         rel_types_name[name] = rel
 build_rel_tables()
-
-def get_type_id(name):
-    return types_name[name][0]
-
-def get_rel_type_id(name):
-    return rel_types_name[name][0]
 
 def get_write_table(tables):
     if g.disallow_db_writes:
@@ -810,7 +804,7 @@ def translate_thing_value(rval):
         return rval
 
 #will assume parameters start with a _ for consistency
-def find_things(type_id, get_cols, sort, limit, constraints):
+def find_things(type_id, get_cols, sort, limit, offset, constraints):
     table = get_thing_table(type_id)[0]
     constraints = deepcopy(constraints)
 
@@ -831,6 +825,9 @@ def find_things(type_id, get_cols, sort, limit, constraints):
 
     if limit:
         s = s.limit(limit)
+
+    if offset:
+        s = s.offset(offset)
 
     try:
         r = add_request_info(s).execute()
@@ -857,7 +854,7 @@ def translate_data_value(alias, op):
 
 #TODO sort by data fields
 #TODO sort by id wants thing_id
-def find_data(type_id, get_cols, sort, limit, constraints):
+def find_data(type_id, get_cols, sort, limit, offset, constraints):
     t_table, d_table = get_thing_table(type_id)
     constraints = deepcopy(constraints)
 
@@ -914,6 +911,9 @@ def find_data(type_id, get_cols, sort, limit, constraints):
     if limit:
         s = s.limit(limit)
 
+    if offset:
+        s = s.offset(offset)
+
     try:
         r = add_request_info(s).execute()
     except Exception, e:
@@ -924,7 +924,7 @@ def find_data(type_id, get_cols, sort, limit, constraints):
     return Results(r, lambda(row): row if get_cols else row.thing_id)
 
 
-def find_rels(rel_type_id, get_cols, sort, limit, constraints):
+def find_rels(rel_type_id, get_cols, sort, limit, offset, constraints):
     tables = get_rel_table(rel_type_id)
     r_table, t1_table, t2_table, d_table = tables
     constraints = deepcopy(constraints)
@@ -990,6 +990,9 @@ def find_rels(rel_type_id, get_cols, sort, limit, constraints):
 
     if limit:
         s = s.limit(limit)
+
+    if offset:
+        s = s.offset(offset)
 
     try:
         r = add_request_info(s).execute()

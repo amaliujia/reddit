@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -32,9 +32,9 @@ SPRITE_PADDING = 6
 sprite_line = re.compile(r"background-image: *url\((.*)\) *.*/\* *SPRITE *(stretch-x)? *\*/")
 
 
-def optimize_png(filename, optimizer='/usr/bin/env optipng'):
+def optimize_png(filename):
     with open(os.path.devnull, 'w') as devnull:
-        subprocess.check_call(' '.join((optimizer, filename)), shell=True, stdout=devnull)
+        subprocess.check_call(("/usr/bin/optipng", filename), stdout=devnull)
 
 
 def _extract_css_info(match):

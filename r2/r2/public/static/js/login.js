@@ -1,11 +1,5 @@
 r.login = {
     post: function(form, action) {
-        if (r.config.cnameframe && !r.config.https_endpoint) {
-            form.$el.unbind()
-            form.$el.submit()
-            return
-        }
-
         var username = $('input[name="user"]', form.$el).val(),
             endpoint = r.config.https_endpoint || ('http://'+r.config.ajax_domain),
             apiTarget = endpoint+'/api/'+action+'/'+username
@@ -112,6 +106,32 @@ r.login.ui = {
         }
     },
 
+    _determinePopupEventName: function(el) {
+      var $el = $(el);
+
+      if ($el.hasClass('up')) {
+        return 'upvote';
+      } else if ($el.hasClass('down')) {
+        return 'downvote';
+      } else if ($el.hasClass('arrow')) {
+        return 'arrow';
+      } else if ($el.hasClass('give-gold')) {
+        return 'give-gold';
+      } else if ($el.parents("#header").length && $el.attr('href').indexOf('login') !== -1) {
+        return 'login-or-register';
+      } else if ($el.parents('.subscribe-button').length) {
+        return 'subscribe-button';
+      } else if ($el.parents('.submit-link').length) {
+        return 'submit-link';
+      } else if ($el.parents('.submit-text').length) {
+        return 'submit-text';
+      } else if ($el.parents('.share-button').length) {
+        return 'share-button';
+      } else {
+        return $el.attr('class');
+      }
+    },
+
     loginRequiredAction: function(e) {
         if (r.config.logged) {
             return true
@@ -130,10 +150,16 @@ r.login.ui = {
                 }
             }
 
-            this.popup.showLogin(true, dest && $.proxy(function() {
+            this.popup.showLogin(true, dest && $.proxy(function(result) {
                 this.popup.loginForm.$el.addClass('working')
+                var hsts_redir = result.json.data.hsts_redir
+                if(hsts_redir) {
+                    dest = hsts_redir + encodeURIComponent(dest)
+                }
                 window.location = dest
             }, this))
+
+            r.analytics.fireGAEvent('login-required-popup', 'opened', this._determinePopupEventName(el));
 
             return false
         }
@@ -170,6 +196,7 @@ r.ui.LoginForm.prototype = $.extend(new r.ui.Form(), {
     },
 
     _submit: function() {
+        r.analytics.fireGAEvent('login-form', 'submit');
         return r.login.post(this, 'login')
     },
 
@@ -182,8 +209,15 @@ r.ui.LoginForm.prototype = $.extend(new r.ui.Form(), {
                 this.$el.addClass('working')
                 var base = r.config.extension ? '/.'+r.config.extension : '/',
                     defaultDest = /\/login\/?$/.test($.url().attr('path')) ? base : window.location,
-                    destParam = this.$el.find('input[name="dest"]').val()
-                window.location = destParam || defaultDest
+                    destParam = this.$el.find('input[name="dest"]').val(),
+                    hsts_redir = result.json.data.hsts_redir
+                var redir = destParam || defaultDest
+                // We might need to redirect through the base domain to grab
+                // our HSTS grant.
+                if (hsts_redir) {
+                    redir = hsts_redir + encodeURIComponent(redir)
+                }
+                window.location = redir
             }
         } else {
             r.ui.Form.prototype._handleResult.call(this, result)
@@ -215,6 +249,7 @@ r.ui.RegisterForm = function() {
     this.$submit = this.$el.find('.submit button')
 }
 r.ui.RegisterForm.prototype = $.extend(new r.ui.Form(), {
+    maxName: 0,
     usernameChanged: function() {
         var name = this.$user.val()
         if (name == this._priorName) {
@@ -224,12 +259,20 @@ r.ui.RegisterForm.prototype = $.extend(new r.ui.Form(), {
         }
 
         this.$el.find('.error.field-user').hide()
+        this.$el.removeClass('name-checking name-available name-taken')
+
+        this.maxName = Math.max(this.maxName, name.length)
+        if (name && this.maxName >= 3) {
+            this.$el.addClass('name-checking')
+            this.checkUsernameDebounced()
+        }
+
         this.$submit.attr('disabled', false)
-        this.checkUsernameDebounced(name)
-        this.$el.toggleClass('name-checking', !!name)
     },
 
-    checkUsername: function(name) {
+    checkUsername: function() {
+        var name = this.$user.val()
+
         if (name) {
             $.ajax({
                 url: '/api/username_available.json',
@@ -247,14 +290,13 @@ r.ui.RegisterForm.prototype = $.extend(new r.ui.Form(), {
             this.showErrors(result.json.errors)
             this.$submit.attr('disabled', true)
         } else {
-            this.$el
-                .removeClass('name-available name-taken')
-                .addClass(result ? 'name-available' : 'name-taken')
+            this.$el.addClass(result ? 'name-available' : 'name-taken')
             this.$submit.attr('disabled', result == false)
         }
     },
 
     _submit: function() {
+        r.analytics.fireGAEvent('register-form', 'submit');
         return r.login.post(this, 'register')
     },
 

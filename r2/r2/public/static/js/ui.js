@@ -3,10 +3,10 @@ r.ui.init = function() {
     if ($.cookie('reddit_first')) {
         // save welcome seen state and delete obsolete cookie
         $.cookie('reddit_first', null, {domain: r.config.cur_domain})
-        store.set('ui.shown.welcome', true)
-    } else if (store.get('ui.shown.welcome') != true) {
+        store.safeSet('ui.shown.welcome', true)
+    } else if (store.safeGet('ui.shown.welcome') != true) {
         $('.infobar.welcome').show()
-        store.set('ui.shown.welcome', true)
+        store.safeSet('ui.shown.welcome', true)
     }
 
     // mobile suggest infobar
@@ -28,7 +28,101 @@ r.ui.init = function() {
         $(el).data('HelpBubble', new r.ui.Bubble({el: el}))
     })
 
+    $('.submit_text').each(function(idx, el) {
+        $(el).data('SubredditSubmitText', new r.ui.SubredditSubmitText({el: el}))
+    })
+
+    if (r.config.new_window) {
+        $(document.body).on('click', 'a.may-blank, .may-blank-within a', function() {
+            if (!this.target) {
+                this.target = '_blank'
+            }
+            return true // continue bubbling
+        })
+    }
+
     r.ui.PermissionEditor.init()
+
+    r.ui.initLiveTimestamps()
+
+    r.ui.initTimings()
+}
+
+r.ui.TimeTextScrollListener = r.ScrollUpdater.extend({
+    initialize: function(options) {
+        this.timeText = options.timeText
+        this.timeText.updateCache($(this.selector))
+    },
+    selector: '.live-timestamp:visible',
+    endUpdate: function($els) {
+        this.timeText.updateCache($els)
+    }
+})
+
+r.ui.initLiveTimestamps = function() {
+    // We only want a global timestamp scroll listener to instantiate on
+    // pages with `thing`s. Since we don't have a router yet, we'll scope
+    // the element to `.sitetable`s, which will contain it. This is kind of a
+    // dirty hack and should be obsoleted by a router + view system.
+    if ($('.sitetable').length) {
+      var listener = new r.ui.TimeTextScrollListener({
+        el: '.sitetable',
+        timeText: new r.TimeText,
+      })
+      listener.start()
+
+      // Every time we add a new `thing`, we'll need to re-grab our element caches.
+      $(document).on('new_things_inserted', function() {
+          listener.restart()
+      })
+    }
+}
+
+r.ui.initTimings = function() {
+  // sample at a rate of 5%
+  if (Math.random() > 0.05) { return }
+
+  if (!r.config.pageInfo.actionName) { return }
+
+  var browserTimings = new r.NavigationTimings()
+
+  $(function() {
+    _.defer(function() {
+      browserTimings.fetch()
+
+      var timingData = browserTimings.filter(function(t) {
+        return t.get('key') !== 'start'
+      }).reduce(function(o, t) {
+        if (!t.isValid()) { return o }
+
+        var val = t.duration()
+
+        if (val > 0) {
+        // Add 'Timing' because some of these keys clobber globals in pylons
+          var key = t.get('key') + 'Timing'
+          o[key] = val
+        }
+
+        return o
+      }, {})
+
+      timingData.actionName = r.config.pageInfo.actionName
+      timingData.verification = r.config.pageInfo.verification
+
+      $.post('/web/timings', timingData)
+
+      // Sample at 1% of 1% for now
+      if (Math.random() <= 0.01 && r.config.stats_domain ) {
+        $.ajax({
+          type: 'POST',
+          url: r.config.stats_domain,
+          data: JSON.stringify({ rum: timingData  }),
+          contentType: 'application/json; charset=utf-8',
+          dataType: 'json',
+        })
+      }
+    })
+  })
 }
 
 r.ui.showWorkingDeferred = function(el, deferred) {
@@ -175,19 +269,17 @@ r.ui.Bubble = Backbone.View.extend({
         var parentPos = this.$parent.offset(),
             bodyOffset = $('body').offset(),
             offsetX, offsetY
-        if (this.$el.is('.anchor-top')) {
+        if (this.$el.is('.anchor-top') || this.$el.is('.anchor-top-centered')) {
             offsetX = this.$parent.outerWidth(true) - this.$el.outerWidth(true)
             offsetY = this.$parent.outerHeight(true) + 5
             this.$el.css({
-                left: parentPos.left + offsetX,
+                left: Math.max(parentPos.left + offsetX, 0),
                 top: parentPos.top + offsetY - bodyOffset.top
             })
-        } else if (this.$el.is('.anchor-right')) {
-            offsetX = 16
-            offsetY = 0
-            parentPos.right = $(window).width() - parentPos.left
+        } else if (this.$el.is('.anchor-top-left')) {
+            offsetY = this.$parent.outerHeight(true) + 5
             this.$el.css({
-                right: parentPos.right + offsetX,
+                left: parentPos.left,
                 top: parentPos.top + offsetY - bodyOffset.top
             })
         } else if (this.$el.is('.anchor-right-fixed')) {
@@ -200,6 +292,21 @@ r.ui.Bubble = Backbone.View.extend({
             this.$el.css({
                 top: r.utils.clamp(parentPos.top - offsetY, 0, $(window).height() - this.$el.outerHeight()),
                 left: r.utils.clamp(parentPos.left - offsetX - this.$el.width(), 0, $(window).width())
+            })
+        } else if (this.$el.is('.anchor-left')) {
+            offsetX = this.$parent.outerWidth(true) + 16
+            offsetY = 0
+            this.$el.css({
+                left: parentPos.left + offsetX,
+                top: parentPos.top + offsetY - bodyOffset.top
+            })
+        }  else { // anchor-right
+            offsetX = 16
+            offsetY = 0
+            parentPos.right = $(window).width() - parentPos.left
+            this.$el.css({
+                right: parentPos.right + offsetX,
+                top: parentPos.top + offsetY - bodyOffset.top
             })
         }
     },
@@ -261,13 +368,16 @@ r.ui.Bubble = Backbone.View.extend({
         }
 
         var animProp, animOffset
-        if (this.$el.is('.anchor-top')) {
+        if (this.$el.is('.anchor-top') || this.$el.is('.anchor-top-centered') || this.$el.is('.anchor-top-left')) {
             animProp = 'top'
             animOffset = '-=5'
-        } else if (this.$el.is('.anchor-right')) {
+        } else if (this.$el.is('.anchor-right-fixed')) {
             animProp = 'right'
             animOffset = '-=5'
-        } else if (this.$el.is('.anchor-right-fixed')) {
+        } else if (this.$el.is('.anchor-left')) {
+            animProp = 'left'
+            animOffset = '+=5'
+        } else { // anchor-right
             animProp = 'right'
             animOffset = '-=5'
         }
@@ -601,6 +711,61 @@ r.ui.ConfirmButton = Backbone.View.extend({
             this.$target.show()
         } else if (target.is('.yes')) {
             this.$target.trigger('confirm')
+        }
+    }
+})
+
+r.ui.SubredditSubmitText = Backbone.View.extend({
+    initialize: function() {
+        this.lookup = _.throttle(this._lookup, 500)
+        this.cache = new r.utils.LRUCache()
+        this.$input = $('#sr-autocomplete')
+        this.$input.on('sr-changed change input', _.bind(this.lookup, this))
+        this.$sr = this.$el.find('.sr').first()
+        this.$content = this.$el.find('.content').first()
+        if (this.$content.text().trim()) {
+            this.$sr.text(r.config.post_site)
+            this.show()
+        }
+    },
+
+    _lookup: function() {
+        this.$content.empty()
+        var sr = this.$input.val()
+        this.$sr.text(sr)
+        this.$el.addClass('working')
+        if (this.req && this.req.abort) {
+            this.req.abort()
+        }
+        this.req = this.cache.ajax(sr, {
+            url: '/r/' + sr + '/api/submit_text/.json',
+            dataType: 'json'
+        }).done(_.bind(this.settext, this, sr))
+          .fail(_.bind(this.error, this))
+    },
+
+    show: function() {
+        this.$el.addClass('enabled')
+    },
+
+    hide: function() {
+        this.$el.removeClass('enabled')
+    },
+
+    error: function() {
+        delete this.req
+        this.hide()
+    },
+
+    settext: function(sr, data) {
+        delete this.req
+        if (!data.submit_text || !data.submit_text.trim()) {
+            this.hide()
+        } else {
+            this.$sr.text(sr)
+            this.$content.html($.unsafe(data.submit_text_html))
+            this.$el.removeClass('working')
+            this.show()
         }
     }
 })

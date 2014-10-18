@@ -16,24 +16,28 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from datetime import datetime
 from urlparse import urlparse
+
+import base64
 import ConfigParser
+import locale
 import json
 import logging
 import os
 import signal
+import site
 import socket
 import subprocess
 import sys
 
 from sqlalchemy import engine, event
 
-import cssutils
+import pkg_resources
 import pytz
 
 from r2.config import queues
@@ -53,15 +57,17 @@ from r2.lib.cache import (
 )
 from r2.lib.configparse import ConfigValue, ConfigValueParser
 from r2.lib.contrib import ipaddress
-from r2.lib.countries import get_countries_and_codes
 from r2.lib.lock import make_lock_factory
 from r2.lib.manager import db_manager
 from r2.lib.plugin import PluginLoader
+from r2.lib.providers import select_provider
 from r2.lib.stats import Stats, CacheStats, StatsCollectingConnectionPool
 from r2.lib.translation import get_active_langs, I18N_PATH
 from r2.lib.utils import config_gold_price, thread_dump
 
+
 LIVE_CONFIG_NODE = "/config/live"
+SECRETS_NODE = "/config/secrets"
 
 
 def extract_live_config(config, plugins):
@@ -81,6 +87,54 @@ def extract_live_config(config, plugins):
     return parsed
 
 
+def _decode_secrets(secrets):
+    return {key: base64.b64decode(value) for key, value in secrets.iteritems()}
+
+
+def extract_secrets(config):
+    # similarly to the live_config one above, if we just did
+    # .options("secrets") we'd get back all the junk from DEFAULT too. bleh.
+    secrets = config._sections["secrets"].copy()
+    del secrets["__name__"]  # magic value used by ConfigParser
+    return _decode_secrets(secrets)
+
+
+def fetch_secrets(zk_client):
+    node_data = zk_client.get(SECRETS_NODE)[0]
+    secrets = json.loads(node_data)
+    return _decode_secrets(secrets)
+
+
+PERMISSIONS = {
+    "admin": "admin",
+    "sponsor": "sponsor",
+    "employee": "employee",
+}
+
+
+class PermissionFilteredEmployeeList(object):
+    def __init__(self, config, type):
+        self.config = config
+        self.type = type
+
+    def __iter__(self):
+        return (username
+                for username, permission in self.config["employees"].iteritems()
+                if permission == self.type)
+
+    def __getitem__(self, key):
+        return list(self)[key]
+
+    def __contains__(self, item):
+        # since we do these permission checks off usernames, make it case
+        # insensitive to relax config file editing pains (safe because
+        # Account._by_name is case-insensitive)
+        return any(item.lower() == username.lower() for username in self)
+
+    def __repr__(self):
+        return "<PermissionFilteredEmployeeList %r>" % (list(self),)
+
+
 class Globals(object):
     spec = {
 
@@ -96,23 +150,20 @@ class Globals(object):
             'MIN_DOWN_KARMA',
             'MIN_RATE_LIMIT_KARMA',
             'MIN_RATE_LIMIT_COMMENT_KARMA',
-            'VOTE_AGE_LIMIT',
-            'REPLY_AGE_LIMIT',
-            'REPORT_AGE_LIMIT',
             'HOT_PAGE_AGE',
-            'RATELIMIT',
             'QUOTA_THRESHOLD',
             'ADMIN_COOKIE_TTL',
             'ADMIN_COOKIE_MAX_IDLE',
             'OTP_COOKIE_TTL',
+            'hsts_max_age',
             'num_comments',
             'max_comments',
             'max_comments_gold',
-            'num_default_reddits',
             'max_sr_images',
             'num_serendipity',
             'sr_dropdown_threshold',
             'comment_visits_period',
+            'butler_max_mentions',
             'min_membership_create_community',
             'bcrypt_work_factor',
             'cassandra_pool_size',
@@ -123,17 +174,27 @@ class Globals(object):
             'sr_contributor_quota',
             'sr_quota_time',
             'sr_invite_limit',
+            'thumbnail_hidpi_scaling',
             'wiki_keep_recent_days',
             'wiki_max_page_length_bytes',
             'wiki_max_page_name_length',
             'wiki_max_page_separators',
+            'min_promote_future',
+            'max_promote_future',
+            'RL_RESET_MINUTES',
+            'RL_OAUTH_RESET_MINUTES',
+            'comment_karma_display_floor',
+            'link_karma_display_floor',
         ],
 
         ConfigValue.float: [
+            'default_promote_bid',
             'min_promote_bid',
             'max_promote_bid',
             'statsd_sample_rate',
             'querycache_prune_chance',
+            'RL_AVG_REQ_PER_SEC',
+            'RL_OAUTH_AVG_REQ_PER_SEC',
         ],
 
         ConfigValue.bool: [
@@ -151,15 +212,16 @@ class Globals(object):
             'read_only_mode',
             'disable_wiki',
             'heavy_load_mode',
-            's3_media_direct',
             'disable_captcha',
             'disable_ads',
             'disable_require_admin_otp',
-            'static_pre_gzipped',
-            'static_secure_pre_gzipped',
             'trust_local_proxies',
             'shard_link_vote_queues',
             'shard_commentstree_queues',
+            'subreddit_stylesheets_static',
+            'ENFORCE_RATELIMIT',
+            'RL_SITEWIDE_ENABLED',
+            'RL_OAUTH_SITEWIDE_ENABLED',
         ],
 
         ConfigValue.tuple: [
@@ -171,21 +233,23 @@ class Globals(object):
             'rendercaches',
             'pagecaches',
             'memoizecaches',
+            'srmembercaches',
+            'ratelimitcaches',
             'cassandra_seeds',
-            'admins',
-            'sponsors',
             'automatic_reddits',
-            'allowed_css_linked_domains',
-            'authorized_cnames',
             'hardcache_categories',
-            's3_media_buckets',
-            'allowed_pay_countries',
             'case_sensitive_domains',
+            'known_image_domains',
             'reserved_subdomains',
+            'offsite_subdomains',
             'TRAFFIC_LOG_HOSTS',
             'exempt_login_user_agents',
             'timed_templates',
-            'sample_multis',
+            'autoexpand_media_types',
+        ],
+
+        ConfigValue.tuple_of(ConfigValue.int): [
+            'thumbnail_size',
         ],
 
         ConfigValue.dict(ConfigValue.str, ConfigValue.int): [
@@ -196,46 +260,64 @@ class Globals(object):
             'wiki_page_registration_info',
             'wiki_page_privacy_policy',
             'wiki_page_user_agreement',
+            'wiki_page_gold_bottlecaps',
         ],
 
-        ConfigValue.choice: {
-             'cassandra_rcl': {
-                 'ONE': CL_ONE,
-                 'QUORUM': CL_QUORUM
-             },
-             'cassandra_wcl': {
-                 'ONE': CL_ONE,
-                 'QUORUM': CL_QUORUM
-             },
-        },
+        ConfigValue.choice(ONE=CL_ONE, QUORUM=CL_QUORUM): [
+             'cassandra_rcl',
+             'cassandra_wcl',
+        ],
+
+        ConfigValue.timeinterval: [
+            'ARCHIVE_AGE',
+        ],
 
         config_gold_price: [
             'gold_month_price',
             'gold_year_price',
+            'cpm_selfserve',
+            'cpm_selfserve_geotarget_metro',
+            'cpm_selfserve_collection',
         ],
     }
 
     live_config_spec = {
         ConfigValue.bool: [
-            'frontpage_dart',
+            'frontend_logging',
+        ],
+        ConfigValue.int: [
+            'cflag_min_votes',
         ],
         ConfigValue.float: [
+            'cflag_lower_bound',
+            'cflag_upper_bound',
             'spotlight_interest_sub_p',
             'spotlight_interest_nosub_p',
+            'gold_revenue_goal',
         ],
         ConfigValue.tuple: [
-            'sr_discovery_links',
             'fastlane_links',
+            'listing_chooser_sample_multis',
+            'discovery_srs',
+            'proxy_gilding_accounts',
+        ],
+        ConfigValue.str: [
+            'listing_chooser_gold_multi',
+            'listing_chooser_explore_sr',
         ],
         ConfigValue.dict(ConfigValue.int, ConfigValue.float): [
             'comment_tree_version_weights',
         ],
         ConfigValue.messages: [
-            'goldvertisement_blurbs',
-            'goldvertisement_has_gold_blurbs',
             'welcomebar_messages',
             'sidebar_message',
             'gold_sidebar_message',
+        ],
+        ConfigValue.dict(ConfigValue.str, ConfigValue.float): [
+            'pennies_per_server_second',
+        ],
+        ConfigValue.dict(ConfigValue.str, ConfigValue.choice(**PERMISSIONS)): [
+            'employees',
         ],
     }
 
@@ -267,9 +349,18 @@ class Globals(object):
 
         global_conf.setdefault("debug", False)
 
+        # reloading site ensures that we have a fresh sys.path to build our
+        # working set off of. this means that forked worker processes won't get
+        # the sys.path that was current when the master process was spawned
+        # meaning that new plugins will be picked up on regular app reload
+        # rather than having to restart the master process as well.
+        reload(site)
+        self.pkg_resources_working_set = pkg_resources.WorkingSet()
+
         self.config = ConfigValueParser(global_conf)
         self.config.add_spec(self.spec)
-        self.plugins = PluginLoader(self.config.get("plugins", []))
+        self.plugins = PluginLoader(self.pkg_resources_working_set,
+                                    self.config.get("plugins", []))
 
         self.stats = Stats(self.config.get('statsd_addr'),
                            self.config.get('statsd_sample_rate'))
@@ -307,6 +398,15 @@ class Globals(object):
     def setup(self):
         self.queues = queues.declare_queues(self)
 
+        ################# PROVIDERS
+        self.media_provider = select_provider(
+            self.config,
+            self.pkg_resources_working_set,
+            "r2.provider.media",
+            self.media_provider,
+        )
+        self.startup_timer.intermediate("providers")
+
         ################# CONFIGURATION
         # AMQP is required
         if not self.amqp_host:
@@ -321,16 +421,11 @@ class Globals(object):
 
         origin_prefix = self.domain_prefix + "." if self.domain_prefix else ""
         self.origin = "http://" + origin_prefix + self.domain
-        self.secure_domains = set([urlparse(self.payment_domain).netloc])
 
         self.trusted_domains = set([self.domain])
-        self.trusted_domains.update(self.authorized_cnames)
         if self.https_endpoint:
             https_url = urlparse(self.https_endpoint)
-            self.secure_domains.add(https_url.netloc)
             self.trusted_domains.add(https_url.hostname)
-        if getattr(self, 'oauth_domain', None):
-            self.secure_domains.add(self.oauth_domain)
 
         # load the unique hashed names of files under static
         static_files = os.path.join(self.paths.get('static_files'), 'static')
@@ -366,24 +461,13 @@ class Globals(object):
             pool = "reddit-app"
         self.log = logging.LoggerAdapter(log, {"pool": pool})
 
-        # make cssutils use the real logging system
-        csslog = logging.getLogger("cssutils")
-        cssutils.log.setLog(csslog)
-
-        # load the country list
-        countries_file_path = os.path.join(static_files, "countries.json")
-        try:
-            with open(countries_file_path) as handle:
-                self.countries = json.load(handle)
-            self.log.debug("Using countries.json.")
-        except IOError:
-            self.log.warning("Couldn't find countries.json. Using pycountry.")
-            self.countries = get_countries_and_codes()
+        # set locations
+        self.locations = {}
 
         if not self.media_domain:
             self.media_domain = self.domain
         if self.media_domain == self.domain:
-            print ("Warning: g.media_domain == g.domain. " +
+            print >> sys.stderr, ("Warning: g.media_domain == g.domain. " +
                    "This may give untrusted content access to user cookies")
 
         for arg in sys.argv:
@@ -400,6 +484,17 @@ class Globals(object):
             # not all platforms have user signals
             signal.signal(signal.SIGUSR1, thread_dump)
 
+        locale.setlocale(locale.LC_ALL, self.locale)
+
+        # Pre-calculate ratelimit values
+        self.RL_RESET_SECONDS = self.config["RL_RESET_MINUTES"] * 60
+        self.RL_MAX_REQS = int(self.config["RL_AVG_REQ_PER_SEC"] *
+                                      self.RL_RESET_SECONDS)
+
+        self.RL_OAUTH_RESET_SECONDS = self.config["RL_OAUTH_RESET_MINUTES"] * 60
+        self.RL_OAUTH_MAX_REQS = int(self.config["RL_OAUTH_AVG_REQ_PER_SEC"] *
+                                     self.RL_OAUTH_RESET_SECONDS)
+
         self.startup_timer.intermediate("configuration")
 
         ################# ZOOKEEPER
@@ -415,17 +510,28 @@ class Globals(object):
             self.zookeeper = connect_to_zookeeper(zk_hosts, (zk_username,
                                                              zk_password))
             self.live_config = LiveConfig(self.zookeeper, LIVE_CONFIG_NODE)
+            self.secrets = fetch_secrets(self.zookeeper)
             self.throttles = LiveList(self.zookeeper, "/throttles",
                                       map_fn=ipaddress.ip_network,
                                       reduce_fn=ipaddress.collapse_addresses)
         else:
             self.zookeeper = None
             parser = ConfigParser.RawConfigParser()
+            parser.optionxform = str
             parser.read([self.config["__file__"]])
             self.live_config = extract_live_config(parser, self.plugins)
+            self.secrets = extract_secrets(parser)
             self.throttles = tuple()  # immutable since it's not real
 
         self.startup_timer.intermediate("zookeeper")
+
+        ################# PRIVILEGED USERS
+        self.admins = PermissionFilteredEmployeeList(
+            self.live_config, type="admin")
+        self.sponsors = PermissionFilteredEmployeeList(
+            self.live_config, type="sponsor")
+        self.employees = PermissionFilteredEmployeeList(
+            self.live_config, type="employee")
 
         ################# MEMCACHE
         num_mc_clients = self.num_mc_clients
@@ -441,6 +547,19 @@ class Globals(object):
         memoizecaches = CMemcache(
             self.memoizecaches,
             min_compress_len=50 * 1024,
+            num_clients=num_mc_clients,
+        )
+
+        # a pool just for srmember rels
+        srmembercaches = CMemcache(
+            self.srmembercaches,
+            min_compress_len=96,
+            num_clients=num_mc_clients,
+        )
+
+        ratelimitcaches = CMemcache(
+            self.ratelimitcaches,
+            min_compress_len=96,
             num_clients=num_mc_clients,
         )
 
@@ -474,7 +593,7 @@ class Globals(object):
             noreply=True,
             no_block=True,
             num_clients=num_mc_clients,
-            min_compress_len=1400,
+            min_compress_len=480,
         )
 
         # pagecaches hold fully rendered pages
@@ -514,11 +633,6 @@ class Globals(object):
         self.startup_timer.intermediate("cassandra")
 
         ################# POSTGRES
-        event.listens_for(engine.Engine, 'before_cursor_execute')(
-            self.stats.pg_before_cursor_execute)
-        event.listens_for(engine.Engine, 'after_cursor_execute')(
-            self.stats.pg_after_cursor_execute)
-
         self.dbm = self.load_db_params()
         self.startup_timer.intermediate("postgres")
 
@@ -550,6 +664,21 @@ class Globals(object):
             self.memoizecache = MemcacheChain(
                 (localcache_cls(), memoizecaches))
         cache_chains.update(memoizecache=self.memoizecache)
+
+        if stalecaches:
+            self.srmembercache = StaleCacheChain(
+                localcache_cls(),
+                stalecaches,
+                srmembercaches,
+            )
+        else:
+            self.srmembercache = MemcacheChain(
+                (localcache_cls(), srmembercaches))
+        cache_chains.update(srmembercache=self.srmembercache)
+
+        self.ratelimitcache = MemcacheChain(
+                (localcache_cls(), ratelimitcaches))
+        cache_chains.update(ratelimitcache=self.ratelimitcache)
 
         self.rendercache = MemcacheChain((
             localcache_cls(),

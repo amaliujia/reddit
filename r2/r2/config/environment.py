@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -61,9 +61,10 @@ def load_environment(global_conf={}, app_conf={}, setup_globals=True):
 
     g = config['pylons.g'] = Globals(global_conf, app_conf, paths)
     if setup_globals:
+        config['r2.import_private'] = \
+            ConfigValue.bool(global_conf['import_private'])
         g.setup()
         g.plugins.declare_queues(g.queues)
-        r2.config.cache = g.cache
     g.plugins.load_plugins()
     config['r2.plugins'] = g.plugins
     g.startup_timer.intermediate("plugins")

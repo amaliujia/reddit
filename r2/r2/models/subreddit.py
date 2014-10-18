@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -29,37 +29,40 @@ import hashlib
 import itertools
 import json
 
-from pylons import c, g
+from pycassa.util import convert_uuid_to_time
+from pylons import c, g, request
 from pylons.i18n import _
 
 from r2.lib.db.thing import Thing, Relation, NotFound
 from account import Account, AccountsActiveBySR
 from printable import Printable
 from r2.lib.db.userrel import UserRel
-from r2.lib.db.operators import lower, or_, and_, desc
+from r2.lib.db.operators import lower, or_, and_, not_, desc
 from r2.lib.errors import UserRequiredException
+from r2.lib.geoip import location_by_ips
 from r2.lib.memoize import memoize
 from r2.lib.permissions import ModeratorPermissionSet
-from r2.lib.utils import tup, interleave_lists, last_modified_multi, flatten
+from r2.lib.utils import tup, last_modified_multi, fuzz_activity
 from r2.lib.utils import timeago, summarize_markdown
-from r2.lib.cache import sgm
+from r2.lib.cache import sgm, TransitionalCache
 from r2.lib.strings import strings, Score
 from r2.lib.filters import _force_unicode
 from r2.lib.db import tdb_cassandra
-from r2.models.wiki import WikiPage
+from r2.models.wiki import WikiPage, ImagesByWikiPage
+from r2.models.trylater import TryLater, TryLaterBySubject
 from r2.lib.merge import ConflictException
 from r2.lib.cache import CL_ONE
-from r2.lib.contrib.rcssmin import cssmin
-from r2.lib import s3cp
+from r2.lib import hooks
 from r2.models.query_cache import MergedCachedQuery
 import pycassa
 
-import math
-
 from r2.lib.utils import set_last_modified
+from r2.models.keyvalue import NamedGlobals
 from r2.models.wiki import WikiPage
 import os.path
 import random
+
+trylater_hooks = hooks.HookRegistrar()
 
 
 def get_links_sr_ids(sr_ids, sort, time):
@@ -73,6 +76,37 @@ def get_links_sr_ids(sr_ids, sort, time):
     results = [queries.get_links(sr, sort, time)
                for sr in srs]
     return queries.merge_results(*results)
+
+
+def get_request_location():
+    if c.location != '':
+        # unset c attributes have the value ''
+        return c.location
+
+    c.location = None
+
+    if c.user and c.user.pref_use_global_defaults:
+        pass
+    elif getattr(request, 'via_cdn', False):
+        g.stats.simple_event('geoip.cdn_request')
+        edgescape_info = request.environ.get('HTTP_X_AKAMAI_EDGESCAPE')
+        if edgescape_info:
+            try:
+                items = edgescape_info.split(',')
+                location_dict = dict(item.split('=') for item in items)
+                c.location = location_dict.get('country_code', None)
+            except:
+                pass
+    elif getattr(request, 'ip', None):
+        g.stats.simple_event('geoip.non_cdn_request')
+        timer = g.stats.get_timer("geoip_service_timer")
+        timer.start()
+        location = location_by_ips(request.ip)
+        if location:
+            c.location = location.get('country_code', None)
+        timer.stop()
+
+    return c.location
 
 
 class BaseSite(object):
@@ -100,6 +134,10 @@ class BaseSite(object):
     @property
     def analytics_name(self):
         return self.name
+
+    @property
+    def allows_referrers(self):
+        return True
 
     def is_moderator_with_perms(self, user, *perms):
         rel = self.is_moderator(user)
@@ -139,13 +177,19 @@ class BaseSite(object):
         from r2.lib.db import queries
         return queries.get_unmoderated(self, user=c.user)
 
+    def get_edited(self, include_links=True, include_comments=True):
+        from r2.lib.db import queries
+        return queries.get_edited(self, user=c.user,
+                                  include_links=include_links,
+                                  include_comments=include_comments)
+
     def get_all_comments(self):
         from r2.lib.db import queries
         return queries.get_sr_comments(self)
 
-    def get_gilded_comments(self):
+    def get_gilded(self):
         from r2.lib.db import queries
-        return queries.get_gilded_comments(self)
+        return queries.get_gilded(self._id)
 
     @classmethod
     def get_modactions(cls, srs, mod=None, action=None):
@@ -153,29 +197,15 @@ class BaseSite(object):
         from r2.models import ModAction
         return ModAction.get_actions(srs, mod=mod, action=action)
 
-    @property
-    def stylesheet_is_static(self):
-        """Is the subreddit using the newer static file based stylesheets?"""
-        return g.static_stylesheet_bucket and len(self.stylesheet_hash) == 27
-
-    static_stylesheet_prefix = "subreddit-stylesheet/"
-
-    @property
-    def static_stylesheet_name(self):
-        return "".join((self.static_stylesheet_prefix,
-                        self.stylesheet_hash,
-                        ".css"))
+    def get_live_promos(self):
+        raise NotImplementedError
 
     @property
     def stylesheet_url(self):
-        from r2.lib.template_helpers import static, get_domain
-
-        if self.stylesheet_is_static:
-            return static(self.static_stylesheet_name, kind='sr_stylesheet')
-        else:
-            return "http://%s/stylesheet.css?v=%s" % (get_domain(cname=False,
-                                                                 subreddit=True),
-                                                      self.stylesheet_hash)
+        from r2.lib.template_helpers import get_domain
+        return "//%s/stylesheet.css?v=%s" % (get_domain(cname=False,
+                                                        subreddit=True),
+                                             self.stylesheet_hash)
 
 
 class SubredditExists(Exception): pass
@@ -186,12 +216,13 @@ class Subreddit(Thing, Printable, BaseSite):
     # attribute, even on a cname. So c.site.static_path should always be
     # the same as g.static_path.
     _defaults = dict(BaseSite._defaults,
-        stylesheet_rtl=None,
         stylesheet_contents='',
+        stylesheet_contents_secure='',
         stylesheet_modified=None,
+        stylesheet_url_http="",
+        stylesheet_url_https="",
         header_size=None,
         allow_top=False, # overridden in "_new"
-        images={},
         reported=0,
         valid_votes=0,
         show_media=False,
@@ -218,21 +249,30 @@ class Subreddit(Thing, Printable, BaseSite):
         use_quotas=True,
         description="",
         public_description="",
-        prev_description_id="",
-        prev_public_description_id="",
-        allow_comment_gilding=True,
+        submit_text="",
+        allow_gilding=True,
         hide_subscribers=False,
         public_traffic=False,
+        spam_links='high',
+        spam_selfposts='high',
+        spam_comments='low',
+        archive_age=g.ARCHIVE_AGE,
+        gilding_server_seconds=0,
+        contest_mode_upvotes_only=False,
+        collapse_deleted_comments=False,
     )
     _essentials = ('type', 'name', 'lang')
     _data_int_props = Thing._data_int_props + ('mod_actions', 'reported',
-                                               'wiki_edit_karma', 'wiki_edit_age')
+                                               'wiki_edit_karma', 'wiki_edit_age',
+                                               'gilding_server_seconds')
 
     sr_limit = 50
     gold_limit = 100
     DEFAULT_LIMIT = object()
 
     MAX_SRNAME_LENGTH = 200 # must be less than max memcached key length
+    BASE_SELFTEXT_LENGTH = 15000
+    ONLY_SELFTEXT_LENGTH = 40000
 
     # note: for purposely unrenderable reddits (like promos) set author_id = -1
     @classmethod
@@ -340,6 +380,47 @@ class Subreddit(Thing, Printable, BaseSite):
             return None
 
     @property
+    def allowed_types(self):
+        if self.link_type == "any":
+            return set(("link", "self"))
+        return set((self.link_type,))
+
+    @property
+    def selftext_max_length(self):
+        if self.link_type == "self":
+            return self.ONLY_SELFTEXT_LENGTH
+        else:
+            return self.BASE_SELFTEXT_LENGTH
+
+    @property
+    def allows_referrers(self):
+        return self.type in {'public', 'restricted',
+                             'gold_restricted', 'archived'}
+
+    def add_moderator(self, user, **kwargs):
+        if not user.modmsgtime:
+            user.modmsgtime = False
+            user._commit()
+
+        hook = hooks.get_hook("subreddit.add_moderator")
+        hook.call(subreddit=self, user=user)
+
+        return super(Subreddit, self).add_moderator(user, **kwargs)
+
+    def remove_moderator(self, user, **kwargs):
+        hook = hooks.get_hook("subreddit.remove_moderator")
+        hook.call(subreddit=self, user=user)
+
+        ret = super(Subreddit, self).remove_moderator(user, **kwargs)
+
+        is_mod_somewhere = bool(Subreddit.reverse_moderator_ids(user))
+        if not is_mod_somewhere:
+            user.modmsgtime = None
+            user._commit()
+
+        return ret
+
+    @property
     def moderators(self):
         return self.moderator_ids()
 
@@ -413,10 +494,7 @@ class Subreddit(Thing, Printable, BaseSite):
             fuzzed = True
             cached_count = g.cache.get(key)
             if not cached_count:
-                # decay constant is e**(-x / 60)
-                decay = math.exp(float(-count) / 60)
-                jitter = round(5 * decay)
-                count = count + random.randint(0, jitter)
+                count = fuzz_activity(count)
                 g.cache.set(key, count, time=5*60)
             else:
                 count = cached_count
@@ -434,6 +512,12 @@ class Subreddit(Thing, Printable, BaseSite):
     def can_comment(self, user):
         if c.user_is_admin:
             return True
+
+        override = hooks.get_hook("subreddit.can_comment").call_until_return(
+                                                            sr=self, user=user)
+
+        if override is not None:
+            return override
         elif self.is_banned(user):
             return False
         elif self.type == 'gold_restricted' and user.gold:
@@ -468,6 +552,16 @@ class Subreddit(Thing, Printable, BaseSite):
         else:
             return False
 
+    def can_submit_link(self, user):
+        if c.user_is_admin or self.is_moderator_with_perms(user, "posts"):
+            return True
+        return "link" in self.allowed_types
+
+    def can_submit_text(self, user):
+        if c.user_is_admin or self.is_moderator_with_perms(user, "posts"):
+            return True
+        return "self" in self.allowed_types
+
     def can_ban(self, user):
         return (user
                 and (c.user_is_admin
@@ -489,13 +583,32 @@ class Subreddit(Thing, Printable, BaseSite):
         from r2.lib import cssfilter
         if g.css_killswitch or (verify and not self.can_change_stylesheet(c.user)):
             return (None, None)
-    
-        parsed, report = cssfilter.validate_css(content)
-        parsed = parsed.cssText if parsed else ''
-        return (report, parsed)
+
+        if not content:
+            return ([], ("", ""))
+
+        # parse in regular old http mode
+        http_images = ImagesByWikiPage.get_images(self, "config/stylesheet")
+        parsed_http, errors_http = cssfilter.validate_css(
+            content,
+            http_images,
+        )
+
+        # parse and resolve images with https-safe urls
+        https_images = {name: g.media_provider.convert_to_https(url)
+                        for name, url in http_images.iteritems()}
+        parsed_https, errors_https = cssfilter.validate_css(
+            content,
+            https_images,
+        )
+
+        # the two reports should be identical so we'll just return the http one
+        return (errors_http, (parsed_http, parsed_https))
 
     def change_css(self, content, parsed, prev=None, reason=None, author=None, force=False):
         from r2.models import ModAction
+        from r2.lib.media import upload_stylesheet
+
         author = author if author else c.user._id36
         if content is None:
             content = ''
@@ -505,29 +618,28 @@ class Subreddit(Thing, Printable, BaseSite):
             wiki = WikiPage.create(self, 'config/stylesheet')
         wr = wiki.revise(content, previous=prev, author=author, reason=reason, force=force)
 
-        minified = cssmin(parsed)
-        if minified:
-            if g.static_stylesheet_bucket:
-                digest = hashlib.sha1(minified).digest()
-                self.stylesheet_hash = (base64.urlsafe_b64encode(digest)
-                                              .rstrip("="))
-
-                s3cp.send_file(g.static_stylesheet_bucket,
-                               self.static_stylesheet_name,
-                               minified,
-                               content_type="text/css",
-                               never_expire=True,
-                               replace=False,
-                              )
-
+        minified_http, minified_https = parsed
+        if minified_http or minified_https:
+            if g.subreddit_stylesheets_static:
+                self.stylesheet_url_http = upload_stylesheet(minified_http)
+                self.stylesheet_url_https = g.media_provider.convert_to_https(
+                                             upload_stylesheet(minified_https))
+                self.stylesheet_hash = ""
                 self.stylesheet_contents = ""
+                self.stylesheet_contents_secure = ""
                 self.stylesheet_modified = None
             else:
-                self.stylesheet_hash = hashlib.md5(minified).hexdigest()
-                self.stylesheet_contents = minified
+                self.stylesheet_url_http = ""
+                self.stylesheet_url_https = ""
+                self.stylesheet_hash = hashlib.md5(minified_https).hexdigest()
+                self.stylesheet_contents = minified_http
+                self.stylesheet_contents_secure = minified_https
                 self.stylesheet_modified = datetime.datetime.now(g.tz)
         else:
+            self.stylesheet_url_http = ""
+            self.stylesheet_url_https = ""
             self.stylesheet_contents = ""
+            self.stylesheet_contents_secure = ""
             self.stylesheet_hash = ""
             self.stylesheet_modified = datetime.datetime.now(g.tz)
         self.stylesheet_contents_user = ""  # reads from wiki; ensure pg clean
@@ -597,9 +709,8 @@ class Subreddit(Thing, Printable, BaseSite):
 
         if subreddits and c.user_is_loggedin:
             # dict( {Subreddit,Account,name} -> Relationship )
-            SRMember._fast_query(subreddits.values(), (c.user,),
-                                 ('subscriber','contributor','moderator'),
-                                 data=True, eager_load=True, thing_data=True)
+            SRMember._fast_query(subreddits.values(), (c.user,), ('moderator',),
+                                 data=True)
 
         return subreddits if return_dict else subreddits.values()
 
@@ -609,19 +720,42 @@ class Subreddit(Thing, Printable, BaseSite):
 
     @classmethod
     def add_props(cls, user, wrapped):
-        names = ('subscriber', 'moderator', 'contributor')
-        rels = (SRMember._fast_query(wrapped, [user], names) if c.user_is_loggedin else {})
-        defaults = Subreddit.default_subreddits()
+        subscriber_srids = set()
+        moderator_srids = set()
+        contributor_srids = set()
+        srmembers_to_fetch = []
+
+        if not user or not c.user_is_loggedin or not user.has_subscribed:
+            # NOTE: add_props is called with user = c.user, so
+            # default_subreddits (which uses c.user rather than taking user as
+            # an argument) will act as expected
+            default_srids = Subreddit.default_subreddits()
+            subscriber_srids.update(default_srids)
+        else:
+            srmembers_to_fetch.append('subscriber')
+
+        if user and c.user_is_loggedin:
+            srmembers_to_fetch.extend(['moderator', 'contributor'])
+
+        if srmembers_to_fetch:
+            rels = SRMember._fast_query(wrapped, [user], srmembers_to_fetch)
+            for (item, i_user, rel_name), rel in rels.iteritems():
+                if not rel:
+                    continue
+                elif rel_name == 'subscriber':
+                    subscriber_srids.add(item._id)
+                elif rel_name == 'moderator':
+                    moderator_srids.add(item._id)
+                elif rel_name == 'contributor':
+                    contributor_srids.add(item._id)
+
         target = "_top" if c.cname else None
         for item in wrapped:
-            if not user or not user.has_subscribed:
-                item.subscriber = item._id in defaults
-            else:
-                item.subscriber = bool(rels.get((item, user, 'subscriber')))
-            item.moderator = bool(rels.get((item, user, 'moderator')))
-            item.contributor = bool(item.type != 'public' and
+            item.subscriber = item._id in subscriber_srids
+            item.moderator = item._id in moderator_srids
+            item.contributor = (item.type != 'public' and
                                     (item.moderator or
-                                     rels.get((item, user, 'contributor'))))
+                                     item._id in contributor_srids))
 
             if item.hide_subscribers and not c.user_is_admin:
                 item._ups = 0
@@ -637,7 +771,6 @@ class Subreddit(Thing, Printable, BaseSite):
 
             #will seem less horrible when add_props is in pages.py
             from r2.lib.pages import UserText
-            item.description_usertext = UserText(item, item.description, target=target)
             if item.public_description or item.description:
                 text = (item.public_description or
                         summarize_markdown(item.description))
@@ -649,58 +782,37 @@ class Subreddit(Thing, Printable, BaseSite):
 
 
         Printable.add_props(user, wrapped)
-    #TODO: make this work
-    cache_ignore = set(["subscribers"]).union(Printable.cache_ignore)
+
+    cache_ignore = {
+        "description",
+        "public_description",
+        "subscribers",
+    }.union(Printable.cache_ignore)
+
     @staticmethod
     def wrapped_cache_key(wrapped, style):
         s = Printable.wrapped_cache_key(wrapped, style)
-        s.extend([wrapped._spam])
         return s
 
     @classmethod
-    def top_lang_srs(cls, lang, limit, filter_allow_top = False, over18 = True,
-                     over18_only = False, ids=False, stale=False):
-        from r2.lib import sr_pops
-        lang = tup(lang)
-
-        sr_ids = sr_pops.pop_reddits(lang, over18, over18_only, filter_allow_top = filter_allow_top)
-        sr_ids = sr_ids[:limit]
-
-        return (sr_ids if ids
-                else Subreddit._byID(sr_ids, data=True, return_dict=False, stale=stale))
-
-    @classmethod
-    def default_subreddits(cls, ids = True, over18 = False, limit = g.num_default_reddits,
-                           stale=True):
-        """
-        Generates a list of the subreddits any user with the current
-        set of language preferences and no subscriptions would see.
-
-        An optional kw argument 'limit' is defaulted to g.num_default_reddits
-        """
-
-        # we'll let these be unordered for now
-        auto_srs = []
+    def default_subreddits(cls, ids=True, stale=True):
+        """Return the subreddits a user with no subscriptions would see."""
         if g.automatic_reddits:
-            auto_srs = map(lambda sr: sr._id,
-                           Subreddit._by_name(g.automatic_reddits, stale=stale).values())
+            auto_srs = cls._by_name(g.automatic_reddits, stale=stale).values()
+        else:
+            auto_srs = set()
 
-        srs = cls.top_lang_srs(c.content_langs, limit + len(auto_srs),
-                               filter_allow_top = True,
-                               over18 = over18, ids = True,
-                               stale=stale)
+        location = get_request_location()
+        srids = LocalizedDefaultSubreddits.get_defaults(location)
 
-        rv = []
-        for sr in srs:
-            if len(rv) >= limit:
-                break
-            if sr in auto_srs:
-                continue
-            rv.append(sr)
+        srs = Subreddit._byID(srids, data=True, return_dict=False, stale=stale)
+        srs = list(set(srs) | set(auto_srs))
+        srs = filter(lambda sr: sr.allow_top, srs)
 
-        rv = auto_srs + rv
-
-        return rv if ids else Subreddit._byID(rv, data=True, return_dict=False, stale=stale)
+        if ids:
+            return [sr._id for sr in srs]
+        else:
+            return srs
 
     @classmethod
     @memoize('random_reddits', time = 1800)
@@ -739,17 +851,41 @@ class Subreddit(Thing, Printable, BaseSite):
         return sr_ids + automatic_ids
 
     @classmethod
-    def random_reddit(cls, limit=2500, over18=False, user=None):
-        srs = cls.top_lang_srs(c.content_langs, limit,
-                               filter_allow_top = False,
-                               over18 = over18,
-                               over18_only = over18,
-                               ids=True)
+    def random_reddit(cls, over18=False, user=None):
+        if over18:
+            sr_ids = NamedGlobals.get("popular_over_18_sr_ids")
+        else:
+            sr_ids = NamedGlobals.get("popular_sr_ids")
+
         if user:
-            excludes = cls.user_subreddits(user, over18=over18, limit=None)
-            srs = list(set(srs) - set(excludes))
-        return (Subreddit._byID(random.choice(srs))
-                if srs else Subreddit._by_name(g.default_sr))
+            excludes = set(cls.user_subreddits(user, limit=None))
+            sr_ids = list(set(sr_ids) - excludes)
+
+        if not sr_ids:
+            return Subreddit._by_name(g.default_sr)
+
+        sr_id = random.choice(sr_ids)
+        sr = Subreddit._byID(sr_id, data=True)
+        return sr
+
+    @classmethod
+    def update_popular_subreddits(cls, limit=5000):
+        q = cls._query(cls.c.type == "public", sort=desc('_downs'), limit=limit,
+                       data=True)
+        srs = list(q)
+
+        sr_ids = [sr._id for sr in srs if not sr.over_18]
+        over_18_sr_ids = [sr._id for sr in srs if sr.over_18]
+
+        # /r/promos is public but has special handling to make it unviewable
+        promo_sr_id = cls.get_promote_srid()
+        try:
+            sr_ids.remove(promo_sr_id)
+        except ValueError:
+            pass
+
+        NamedGlobals.set("popular_sr_ids", sr_ids)
+        NamedGlobals.set("popular_over_18_sr_ids", over_18_sr_ids)
 
     @classmethod
     def random_subscription(cls, user):
@@ -758,8 +894,7 @@ class Subreddit(Thing, Printable, BaseSite):
                 if srs else Subreddit._by_name(g.default_sr))
 
     @classmethod
-    def user_subreddits(cls, user, ids=True, over18=False, limit=DEFAULT_LIMIT,
-                        stale=False):
+    def user_subreddits(cls, user, ids=True, limit=DEFAULT_LIMIT, stale=False):
         """
         subreddits that appear in a user's listings. If the user has
         subscribed, returns the stored set of subscriptions.
@@ -791,9 +926,7 @@ class Subreddit(Thing, Printable, BaseSite):
                                                       return_dict=False,
                                                       stale=stale)
         else:
-            return cls.default_subreddits(ids = ids, over18=over18,
-                                          limit=g.num_default_reddits,
-                                          stale=stale)
+            return cls.default_subreddits(ids=ids, stale=stale)
 
 
     # Used to pull all of the SRs a given user moderates or is a contributor
@@ -803,17 +936,10 @@ class Subreddit(Thing, Printable, BaseSite):
         lookup = getattr(cls, 'reverse_%s_ids' % query_param)
         return lookup(user)
 
-    def is_subscriber_defaults(self, user):
-        if user.has_subscribed:
-            return self.is_subscriber(user)
-        else:
-            return self in self.default_subreddits(ids = False)
-
     @classmethod
     def subscribe_defaults(cls, user):
         if not user.has_subscribed:
-            for sr in cls.user_subreddits(None, False,
-                                          limit = g.num_default_reddits):
+            for sr in cls.user_subreddits(user=None, ids=False, limit=None):
                 #this will call reverse_subscriber_ids after every
                 #addition. if it becomes a problem we should make an
                 #add_multiple_subscriber fn
@@ -828,59 +954,6 @@ class Subreddit(Thing, Printable, BaseSite):
 
         user = c.user if c.user_is_loggedin else None
         return self.can_view(user)
-
-    def get_images(self):
-        """
-        Iterator over list of (name, url) pairs which have been
-        uploaded for custom styling of this subreddit. 
-        """
-        for name, img in self.images.iteritems():
-            if name != "/empties/":
-                yield (name, img)
-    
-    def get_num_images(self):
-        if '/empties/' in self.images:
-            return len(self.images) - 1
-        else:
-            return len(self.images)
-    
-    def add_image(self, name, url, max_num = None):
-        """
-        Adds an image to the subreddit's image list.  The resulting
-        number of the image is returned.  Note that image numbers are
-        non-sequential insofar as unused numbers in an existing range
-        will be populated before a number outside the range is
-        returned.
-
-        raises ValueError if the resulting number is >= max_num.
-
-        The Subreddit will be _dirty if a new image has been added to
-        its images list, and no _commit is called.
-        """
-        if max_num is not None and self.get_num_images() >= max_num:
-            raise ValueError, "too many images"
-        
-        # copy and blank out the images list to flag as _dirty
-        l = self.images
-        self.images = None
-        # update the dictionary and rewrite to images attr
-        l[name] = url
-        self.images = l
-
-    def del_image(self, name):
-        """
-        Deletes an image from the images dictionary assuming an image
-        of that name is in the current dictionary.
-
-        The Subreddit will be _dirty if image has been removed from
-        its images list, and no _commit is called.
-        """
-        if self.images.has_key(name):
-            l = self.images
-            self.images = None
-
-            del l[name]
-            self.images = l
 
     def __eq__(self, other):
         if type(self) != type(other):
@@ -925,9 +998,49 @@ class Subreddit(Thing, Printable, BaseSite):
         rel.note = note
         rel._commit()
 
+    def get_live_promos(self):
+        from r2.lib import promote
+        return promote.get_live_promotions([self.name])
+
+    def schedule_unban(self, kind, victim, banner, duration):
+        return SubredditTempBan.schedule(
+            self,
+            kind,
+            victim,
+            banner,
+            datetime.timedelta(days=duration),
+        )
+
+    def unschedule_unban(self, victim, type):
+        SubredditTempBan.unschedule(self.name, victim.name, type)
+
+    def get_tempbans(self, type=None, names=None):
+        return SubredditTempBan.search(self.name, type, names)
+
+    def add_gilding_seconds(self):
+        from r2.models.gold import get_current_value_of_month
+        seconds = get_current_value_of_month()
+        self._incr("gilding_server_seconds", int(seconds))
+
+    @classmethod
+    @memoize("get_promote_srid")
+    def get_promote_srid(cls, name='promos'):
+        try:
+            sr = cls._by_name(name, stale=True)
+        except NotFound:
+            sr = cls._new(name=name,
+                          title="promoted links",
+                          # negative author_ids make this unlisable
+                          author_id=-1,
+                          type="public",
+                          ip='0.0.0.0')
+        return sr._id
+
+
 class FakeSubreddit(BaseSite):
     _defaults = dict(Subreddit._defaults,
         link_flair_position='right',
+        flair_enabled=False,
     )
 
     def __init__(self):
@@ -963,7 +1076,7 @@ class FakeSubreddit(BaseSite):
         from r2.lib.db import queries
         return queries.get_all_comments()
 
-    def get_gilded_comments(self):
+    def get_gilded(self):
         raise NotImplementedError()
 
     def spammy(self):
@@ -982,13 +1095,12 @@ class FriendsSR(FakeSubreddit):
         friends = Account._byID(a.friends[-max_lookup:], return_dict = False,
                                 data = True)
 
-        # if we don't have a last visit for your friends, we don't
-        # care about them
-        last_visits = last_modified_multi(friends, "submitted")
-        friends = [x for x in friends if x in last_visits]
+        # only include friends that have ever interacted with the site
+        last_activity = last_modified_multi(friends, "overview")
+        friends = [x for x in friends if x in last_activity]
 
         # sort friends by most recent interactions
-        friends.sort(key = lambda x: last_visits[x], reverse = True)
+        friends.sort(key = lambda x: last_activity[x], reverse = True)
         return [x._id for x in friends[:limit]]
 
     def get_links(self, sort, time):
@@ -1040,10 +1152,22 @@ class FriendsSR(FakeSubreddit):
                for friend in friends]
         return queries.MergedCachedResults(crs)
 
+    def get_gilded(self):
+        from r2.lib.db.queries import get_gilded_users
+        if not c.user_is_loggedin:
+            raise UserRequiredException
+
+        friends = self.get_important_friends(c.user._id)
+        if not friends:
+            return []
+
+        return get_gilded_users(friends)
+
 
 class AllSR(FakeSubreddit):
     name = 'all'
     title = 'all subreddits'
+    path = '/r/all'
 
     def keep_for_rising(self, sr_id):
         return True
@@ -1067,37 +1191,77 @@ class AllSR(FakeSubreddit):
         from r2.lib.db import queries
         return queries.get_all_comments()
 
-    def get_gilded_comments(self):
+    def get_gilded(self):
         from r2.lib.db import queries
-        return queries.get_all_gilded_comments()
+        return queries.get_all_gilded()
 
 
 class AllMinus(AllSR):
+    analytics_name = "all"
     name = _("%s (filtered)") % "all"
 
     def __init__(self, srs):
         AllSR.__init__(self)
-        self.srs = srs
-        self.sr_ids = [sr._id for sr in srs]
+        self.exclude_srs = srs
+        self.exclude_sr_ids = [sr._id for sr in srs]
 
     def keep_for_rising(self, sr_id):
-        return sr_id not in self.sr_ids
+        return sr_id not in self.exclude_sr_ids
 
     @property
     def title(self):
-        return 'all subreddits except ' + ', '.join(sr.name for sr in self.srs)
+        sr_names = ', '.join(sr.name for sr in self.exclude_srs)
+        return 'all subreddits except ' + sr_names
 
     @property
     def path(self):
-        return '/r/all-' + '-'.join(sr.name for sr in self.srs)
+        return '/r/all-' + '-'.join(sr.name for sr in self.exclude_srs)
 
     def get_links(self, sort, time):
         from r2.models import Link
         from r2.lib.db.operators import not_
         q = AllSR.get_links(self, sort, time)
-        if c.user.gold:
-            q._filter(not_(Link.c.sr_id.in_(self.sr_ids)))
+        if c.user.gold and self.exclude_sr_ids:
+            q._filter(not_(Link.c.sr_id.in_(self.exclude_sr_ids)))
         return q
+
+
+class Filtered(object):
+    unfiltered_path = None
+
+    @property
+    def path(self):
+        return '/me/f/%s' % self.filtername
+
+    @property
+    def title(self):
+        return self.name
+
+    @property
+    def name(self):
+        return _("%s (filtered)") % self.filtername
+
+    @property
+    def multi_path(self):
+        return ('/user/%s/f/%s' % (c.user.name, self.filtername)).lower()
+
+    def _get_filtered_subreddits(self):
+        try:
+            multi = LabeledMulti._byID(self.multi_path)
+        except tdb_cassandra.NotFound:
+            multi = None
+        filtered_srs = multi.srs if multi else []
+        return sorted(filtered_srs, key=lambda sr: sr.name)
+
+
+class AllFiltered(Filtered, AllMinus):
+    unfiltered_path = '/r/all'
+    filtername = 'all'
+
+    def __init__(self):
+        filters = self._get_filtered_subreddits() if c.user.gold else []
+        AllMinus.__init__(self, filters)
+
 
 class _DefaultSR(FakeSubreddit):
     #notice the space before reddit.com
@@ -1171,10 +1335,6 @@ class DefaultSR(_DefaultSR):
         return "t5_6"
     
     @property
-    def images(self):
-        return self._base.images
-    
-    @property
     def _id36(self):
         return self._base._id36
 
@@ -1199,8 +1359,37 @@ class DefaultSR(_DefaultSR):
         return self._base.stylesheet_contents if self._base else ""
 
     @property
+    def stylesheet_contents_secure(self):
+        return self._base.stylesheet_contents_secure if self._base else ""
+
+    @property
+    def stylesheet_url_http(self):
+        return self._base.stylesheet_url_http if self._base else ""
+
+    @property
+    def stylesheet_url_https(self):
+        return self._base.stylesheet_url_https if self._base else ""
+
+    @property
     def stylesheet_hash(self):
         return self._base.stylesheet_hash if self._base else ""
+
+    def get_all_comments(self):
+        from r2.lib.db.queries import get_sr_comments, merge_results
+        srs = Subreddit.user_subreddits(c.user, ids=False)
+        results = [get_sr_comments(sr) for sr in srs]
+        return merge_results(*results)
+
+    def get_gilded(self):
+        from r2.lib.db.queries import get_gilded
+        return get_gilded(Subreddit.user_subreddits(c.user))
+
+    def get_live_promos(self):
+        from r2.lib import promote
+        srs = Subreddit.user_subreddits(c.user, ids=False)
+        # '' is for promos targeted to the frontpage
+        sr_names = [self.name] + [sr.name for sr in srs]
+        return promote.get_live_promotions(sr_names)
 
 
 class MultiReddit(FakeSubreddit):
@@ -1229,6 +1418,10 @@ class MultiReddit(FakeSubreddit):
     def banned_sr_ids(self):
         return [sr._id for sr in self.srs if sr._spam]
 
+    @property
+    def allows_referrers(self):
+        return all(sr.allows_referrers for sr in self.srs)
+
     def keep_for_rising(self, sr_id):
         return sr_id in self.kept_sr_ids
 
@@ -1246,6 +1439,10 @@ class MultiReddit(FakeSubreddit):
         else:
             return FakeSRMember(ModeratorPermissionSet)
 
+    def srs_with_perms(self, user, *perms):
+        return [sr for sr in self.srs
+                if sr.is_moderator_with_perms(user, *perms) and not sr._spam]
+
     @property
     def title(self):
         return _('posts from %s') % ', '.join(sr.name for sr in self.srs)
@@ -1253,6 +1450,10 @@ class MultiReddit(FakeSubreddit):
     @property
     def path(self):
         return self._path
+
+    @property
+    def over_18(self):
+        return any(sr.over_18 for sr in self.srs)
 
     def get_links(self, sort, time):
         return get_links_sr_ids(self.kept_sr_ids, sort, time)
@@ -1263,14 +1464,108 @@ class MultiReddit(FakeSubreddit):
         results = [get_sr_comments(sr) for sr in srs]
         return merge_results(*results)
 
-    def get_gilded_comments(self):
-        from r2.lib.db.queries import get_gilded_comments
-        queries = [get_gilded_comments(sr_id) for sr_id in self.kept_sr_ids]
-        return MergedCachedQuery(queries)
+    def get_gilded(self):
+        from r2.lib.db.queries import get_gilded
+        return get_gilded(self.kept_sr_ids)
+
+    def get_live_promos(self):
+        from r2.lib import promote
+        srs = Subreddit._byID(self.kept_sr_ids, return_dict=False)
+        sr_names = [sr.name for sr in srs]
+        return promote.get_live_promotions(sr_names)
 
 
 class TooManySubredditsError(Exception):
     pass
+
+
+class LocalizedDefaultSubreddits(tdb_cassandra.View):
+    """Mapping of location to subreddit ids"""
+    _use_db = True
+    _compare_with = tdb_cassandra.ASCII_TYPE
+    _read_consistency_level = tdb_cassandra.CL.QUORUM
+    _write_consistency_level = tdb_cassandra.CL.QUORUM
+    _extra_schema_creation_args = {
+        "key_validation_class": tdb_cassandra.ASCII_TYPE,
+        "default_validation_class": tdb_cassandra.ASCII_TYPE,
+    }
+    GLOBAL = "GLOBAL"
+    CACHE_PREFIX = "localized_defaults"
+
+    @classmethod
+    def _rowkey(cls, location):
+        return str(location)
+
+    @classmethod
+    def lookup(cls, keys, update=False):
+        def _lookup(keys):
+            rows = cls._cf.multiget(keys)
+            ret = {}
+            for key in keys:
+                columns = rows[key] if key in rows else {}
+                id36s = columns.keys()
+                ret[key] = id36s
+            return ret
+
+        id36s_by_location = sgm(
+            g.cache, keys, miss_fn=_lookup, prefix=cls.CACHE_PREFIX,
+            _update=update,
+        )
+        ids_by_location = {location: [int(id36, 36) for id36 in id36s]
+                           for location, id36s in id36s_by_location.iteritems()}
+        return ids_by_location
+
+    @classmethod
+    def set_srs(cls, location, srs):
+        rowkey = cls._rowkey(location)
+        columns = {sr._id36: '' for sr in srs}
+
+        # update cassandra
+        try:
+            existing = cls._cf.get(rowkey)
+        except tdb_cassandra.NotFoundException:
+            existing = {}
+
+        cls._set_values(rowkey, columns)
+        removed_srid36s = set(existing.keys()) - set(columns.keys())
+        cls._remove(rowkey, removed_srid36s)
+
+        # update cache
+        id36s = columns.keys()
+        g.cache.set_multi({rowkey: id36s}, prefix=cls.CACHE_PREFIX)
+
+    @classmethod
+    def set_global_srs(cls, srs):
+        location = cls.GLOBAL
+        cls.set_srs(location, srs)
+
+    @classmethod
+    def get_srids(cls, location):
+        if not location:
+            return []
+
+        rowkey = cls._rowkey(location)
+        ids_by_location = cls.lookup([rowkey])
+        srids = ids_by_location[rowkey]
+        return srids
+
+    @classmethod
+    def get_global_defaults(cls):
+        return cls.get_srids(cls.GLOBAL)
+
+    @classmethod
+    def get_defaults(cls, location):
+        location_key = cls._rowkey(location) if location else None
+        global_key = cls._rowkey(cls.GLOBAL)
+        keys = filter(None, [location_key, global_key])
+
+        ids_by_location = cls.lookup(keys)
+
+        if location_key and ids_by_location[location_key]:
+            c.used_localized_defaults = True
+            return ids_by_location[location_key]
+        else:
+            return ids_by_location[global_key]
 
 
 class LabeledMulti(tdb_cassandra.Thing, MultiReddit):
@@ -1365,21 +1660,26 @@ class LabeledMulti(tdb_cassandra.Thing, MultiReddit):
         return sr_columns
 
     @property
+    def kind(self):
+        return self._id.split('/')[3]
+
+    @property
     def sr_props(self):
         return self.columns_to_sr_props(self.sr_columns)
 
     @property
     def path(self):
         if isinstance(self.owner, Account):
-            return '/user/%(username)s/m/%(multiname)s' % {
+            return '/user/%(username)s/%(kind)s/%(multiname)s' % {
                 'username': self.owner.name,
+                'kind': self.kind,
                 'multiname': self.name,
             }
 
     @property
     def user_path(self):
         if self.owner == c.user:
-            return '/me/m/%s' % self.name
+            return '/me/%s/%s' % (self.kind, self.name)
         else:
             return self.path
 
@@ -1394,6 +1694,12 @@ class LabeledMulti(tdb_cassandra.Thing, MultiReddit):
         return 'multi'
 
     @property
+    def allows_referrers(self):
+        if self.visibility != 'public':
+            return False
+        return super(LabeledMulti, self).allows_referrers
+
+    @property
     def title(self):
         if isinstance(self.owner, Account):
             return _('%s subreddits curated by /u/%s') % (self.name, self.owner.name)
@@ -1406,14 +1712,16 @@ class LabeledMulti(tdb_cassandra.Thing, MultiReddit):
         return user == self.owner or self.visibility == 'public'
 
     def can_edit(self, user):
-        if c.user_is_admin:
+        if c.user_is_admin and self.owner == Account.system_user():
             return True
 
         return user == self.owner
 
     @classmethod
-    def by_owner(cls, owner):
-        return list(LabeledMultiByOwner.query([owner._fullname]))
+    def by_owner(cls, owner, kinds=None):
+        kinds = ('m',) if not kinds else kinds
+        multis = LabeledMultiByOwner.query([owner._fullname])
+        return [multi for multi in multis if multi.kind in kinds]
 
     @classmethod
     def create(cls, path, owner):
@@ -1531,6 +1839,11 @@ class ModContribSR(MultiReddit):
     def srs(self):
         return Subreddit._byID(self.sr_ids, data=True, return_dict=False)
 
+    @property
+    def allows_referrers(self):
+        return False
+
+
 class ModSR(ModContribSR):
     name  = "subreddits you moderate"
     title = "subreddits you moderate"
@@ -1539,6 +1852,42 @@ class ModSR(ModContribSR):
 
     def is_moderator(self, user):
         return FakeSRMember(ModeratorPermissionSet)
+
+
+class ModMinus(ModSR):
+    analytics_name = "mod"
+
+    def __init__(self, exclude_srs):
+        ModSR.__init__(self)
+        self.exclude_srs = exclude_srs
+        self.exclude_sr_ids = [sr._id for sr in exclude_srs]
+
+    @property
+    def sr_ids(self):
+        sr_ids = super(ModMinus, self).sr_ids
+        return [sr_id for sr_id in sr_ids if not sr_id in self.exclude_sr_ids]
+
+    @property
+    def name(self):
+        exclude_text = ', '.join(sr.name for sr in self.exclude_srs)
+        return 'subreddits you moderate except ' + exclude_text
+
+    @property
+    def title(self):
+        return self.name
+
+    @property
+    def path(self):
+        return '/r/mod-' + '-'.join(sr.name for sr in self.exclude_srs)
+
+
+class ModFiltered(Filtered, ModMinus):
+    unfiltered_path = '/r/mod'
+    filtername = 'mod'
+
+    def __init__(self):
+        ModMinus.__init__(self, self._get_filtered_subreddits())
+
 
 class ContribSR(ModContribSR):
     name  = "contrib"
@@ -1574,7 +1923,11 @@ class DomainSR(FakeSubreddit):
         FakeSubreddit.__init__(self)
         self.domain = domain
         self.name = domain 
-        self.title = domain + ' ' + _('on reddit.com')
+        self.title = _("%(domain)s on %(reddit.com)s") % {
+            "domain": domain, "reddit.com": g.domain}
+        idn = domain.decode('idna')
+        if idn != domain:
+            self.idn = idn
 
     def get_links(self, sort, time):
         from r2.lib.db import queries
@@ -1590,17 +1943,28 @@ Random = RandomReddit()
 RandomNSFW = RandomNSFWReddit()
 RandomSubscription = RandomSubscriptionReddit()
 
-Subreddit._specials.update(dict(friends = Friends,
-                                randnsfw = RandomNSFW,
-                                myrandom = RandomSubscription,
-                                random = Random,
-                                mod = Mod,
-                                contrib = Contrib,
-                                all = All))
+# add to _specials so they can be retrieved with Subreddit._by_name, e.g.
+# Subreddit._by_name("all")
+Subreddit._specials.update({
+    sr.name: sr for sr in (
+        Friends,
+        RandomNSFW,
+        RandomSubscription,
+        Random,
+        Contrib,
+        All,
+        Frontpage,
+    )
+})
+
+# some subreddits have unfortunate names
+Subreddit._specials['mod'] = Mod
+
 
 class SRMember(Relation(Subreddit, Account)):
     _defaults = dict(encoded_permissions=None)
     _permission_class = None
+    _cache = g.srmembercache
 
     def has_permission(self, perm):
         """Returns whether this member has explicitly been granted a permission.
@@ -1669,8 +2033,84 @@ Subreddit.__bases__ += (
 )
 
 
-class SubredditPopularityByLanguage(tdb_cassandra.View):
-    _use_db = True
-    _value_type = 'pickle'
-    _connection_pool = 'main'
-    _read_consistency_level = CL_ONE
+class SubredditTempBan(object):
+    def __init__(self, sr, kind, victim, banner, duration):
+        self.sr = sr._id36
+        self._srname = sr.name
+        self.who = victim._id36
+        self._whoname = victim.name
+        self.type = kind
+        self.banner = banner._id36
+        self.duration = duration
+
+    @classmethod
+    def schedule(cls, sr, kind, victim, banner, duration):
+        info = {
+            'sr': sr._id36,
+            'who': victim._id36,
+            'type': kind,
+            'banner': banner._id36,
+        }
+        result = TryLaterBySubject.schedule(
+            cls.cancel_rowkey(sr.name, kind),
+            cls.cancel_colkey(victim.name),
+            json.dumps(info),
+            duration,
+            trylater_rowkey=cls.schedule_rowkey(),
+        )
+        return {victim.name: result.keys()[0]}
+
+    @classmethod
+    def cancel_colkey(cls, name):
+        return name
+
+    @classmethod
+    def cancel_rowkey(cls, name, type):
+        return "srunban:%s:%s" % (name, type)
+
+    @classmethod
+    def schedule_rowkey(cls):
+        return "srunban"
+
+    @classmethod
+    def search(cls, srname, bantype, subjects):
+        results = TryLaterBySubject.search(cls.cancel_rowkey(srname, bantype),
+                                           subjects)
+
+        def convert_uuid_to_datetime(uu):
+            return datetime.datetime.fromtimestamp(convert_uuid_to_time(uu),
+                                                   g.tz)
+        return {
+            name: convert_uuid_to_datetime(uu)
+                for name, uu in results.iteritems()
+        }
+
+    @classmethod
+    def unschedule(cls, srname, victim_name, bantype):
+        TryLaterBySubject.unschedule(
+            cls.cancel_rowkey(srname, bantype),
+            cls.cancel_colkey(victim_name),
+            cls.schedule_rowkey(),
+        )
+
+
+@trylater_hooks.on('trylater.srunban')
+def on_subreddit_unban(mature_items):
+    from r2.models.modaction import ModAction
+    for blob in mature_items.itervalues():
+        baninfo = json.loads(blob)
+        container = Subreddit._byID36(baninfo['sr'], data=True)
+        victim = Account._byID36(baninfo['who'], data=True)
+        banner = Account._byID36(baninfo['banner'], data=True)
+        kind = baninfo['type']
+        remove_function = getattr(container, 'remove_' + kind)
+        new = remove_function(victim)
+        g.log.info("Unbanned %s from %s", victim.name, container.name)
+
+        if new:
+            action = dict(
+                banned='unbanuser',
+                wikibanned='wikiunbanned',
+            ).get(kind, None)
+            ModAction.create(container, banner, action, target=victim,
+                             description="was temporary")

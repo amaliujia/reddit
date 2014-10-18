@@ -15,9 +15,19 @@ r.multi = {
                 model: multi,
                 el: detailsEl
             }).render()
+            var subredditList = new r.multi.SubredditList({
+                model: multi,
+                el: detailsEl
+            })
 
             if (location.hash == '#created') {
                 detailsView.focusAdd()
+            }
+
+            // if page has a recs box, wire it up to refresh with the multi.
+            var recsEl = $('#multi-recs')
+            if (recsEl.length) {
+                detailsView.initRecommendations(recsEl)
             }
         }
 
@@ -171,6 +181,10 @@ r.multi.MultiReddit = Backbone.Model.extend({
 
     renameTo: function(newCollection, name) {
         return this._copyOp('rename', newCollection, name)
+    },
+
+    getSubredditNames: function() {
+        return this.subreddits.pluck('name')
     }
 })
 
@@ -198,7 +212,7 @@ r.multi.GlobalMultiCache = Backbone.Collection.extend({
     touch: function(path) {
         var multi = this.get(path)
         if (!multi) {
-            multi = new r.multi.MultiReddit({
+            multi = new this.model({
                 path: path
             })
             this.add(multi)
@@ -207,7 +221,7 @@ r.multi.GlobalMultiCache = Backbone.Collection.extend({
     },
 
     reify: function(response) {
-        var data = r.multi.MultiReddit.prototype.parse(response),
+        var data = this.model.prototype.parse(response),
             multi = this.touch(data.path)
 
         multi.set(data)
@@ -252,24 +266,15 @@ r.multi.MultiSubredditItem = Backbone.View.extend({
     }
 })
 
-r.multi.MultiDetails = Backbone.View.extend({
+r.multi.SubredditList = Backbone.View.extend({
     events: {
-        'submit .add-sr': 'addSubreddit',
-        'change [name="visibility"]': 'setVisibility',
-        'click .show-copy': 'showCopyMulti',
-        'click .show-rename': 'showRenameMulti',
-        'click .edit-description': 'editDescription',
-        'submit .description': 'saveDescription',
-        'confirm .delete': 'deleteMulti'
+        'submit .add-sr': 'addSubreddit'
     },
 
     initialize: function() {
-        this.listenTo(this.model, 'change', this.render)
-        this.listenTo(this.model.description, 'change', this.render)
         this.listenTo(this.model.subreddits, 'add', this.addOne)
         this.listenTo(this.model.subreddits, 'remove', this.removeOne)
         this.listenTo(this.model.subreddits, 'sort', this.resort)
-        this.listenTo(this.model.subreddits, 'add remove reset', this.render)
         new r.ui.ConfirmButton({el: this.$('button.delete')})
 
         this.listenTo(this.model.subreddits, 'add remove', function() {
@@ -280,42 +285,15 @@ r.multi.MultiDetails = Backbone.View.extend({
             r.ui.showWorkingDeferred(this.$el, xhr)
         }, this)
 
-        this.bubbleGroup = {}
-        this.addBubble = new r.multi.MultiAddNoticeBubble({
-            parent: this.$('.add-sr .sr-name'),
-            trackHover: false
-        })
-
+        this.itemView = this.options.itemView || r.multi.MultiSubredditItem
         this.itemViews = {}
+        this.bubbleGroup = {}
         this.$('.subreddits').empty()
         this.model.subreddits.each(this.addOne, this)
     },
-
-    render: function() {
-        var canEdit = this.model.get('can_edit')
-        if (canEdit) {
-            if (this.model.subreddits.isEmpty()) {
-                this.addBubble.show()
-            } else {
-                this.addBubble.hide()
-            }
-        }
-
-        this.$el.toggleClass('readonly', !canEdit)
-
-        if (this.model.description.has('body_html')) {
-            this.$('.description .usertext-body').html(
-                _.unescape(this.model.description.get('body_html'))
-            )
-        }
-
-        this.$('.count').text(this.model.subreddits.length)
-
-        return this
-    },
-
+    
     addOne: function(sr) {
-        var view = new r.multi.MultiSubredditItem({
+        var view = new this.itemView({
             model: sr,
             multi: this.model,
             bubbleGroup: this.bubbleGroup
@@ -340,7 +318,7 @@ r.multi.MultiDetails = Backbone.View.extend({
 
         var nameEl = this.$('.add-sr .sr-name'),
             srNames = nameEl.val()
-        srNames = _.compact(srNames.split(/[\/+,\s]+(?:r\/)?/))
+        srNames = _.compact(srNames.split(/[\/+,\-\s]+(?:r\/)?/))
         if (!srNames.length) {
             return
         }
@@ -360,6 +338,78 @@ r.multi.MultiDetails = Backbone.View.extend({
                     .show()
             }, this)
         })
+    }
+})
+
+r.multi.MultiDetails = Backbone.View.extend({
+    events: {
+        'change [name="visibility"]': 'setVisibility',
+        'click .show-copy': 'showCopyMulti',
+        'click .show-rename': 'showRenameMulti',
+        'click .edit-description': 'editDescription',
+        'submit .description': 'saveDescription',
+        'confirm .delete': 'deleteMulti'
+    },
+
+    initialize: function() {
+        this.listenTo(this.model, 'change', this.render)
+        this.listenTo(this.model.subreddits, 'add remove reset', this.render)
+        this.listenTo(this.model.description, 'change', this.render)
+
+        this.addBubble = new r.multi.MultiAddNoticeBubble({
+            parent: this.$('.add-sr .sr-name'),
+            trackHover: false
+        })
+    },
+
+    // create child model and view to manage recommendations
+    initRecommendations: function(recsEl) {
+        var recs = new r.recommend.RecommendationList()
+        this.recsView = new r.recommend.RecommendationsView({
+            collection: recs,
+            el: recsEl
+        })
+ 
+        // fetch initial data
+        if (!this.model.subreddits.isEmpty()) {
+            recs.fetchForSrs(this.model.getSubredditNames())
+        }
+ 
+        // update recs when multi changes
+        this.listenTo(this.model.subreddits, 'add remove reset',
+            function() {
+                var srNames = this.model.getSubredditNames()
+                recs.fetchForSrs(srNames)
+            })
+        // update multi when a rec is selected
+        this.recsView.bind('recs:select',
+            function(data) {
+                this.model.addSubreddit(data['srName'])
+            }, this)
+    },
+
+    render: function() {
+        var canEdit = this.model.get('can_edit')
+        if (canEdit) {
+            if (this.model.subreddits.isEmpty()) {
+                this.addBubble.show()
+            } else {
+                this.addBubble.hide()
+            }
+        }
+
+        this.$el.toggleClass('readonly', !canEdit)
+        this.$el.toggleClass('public', this.model.get('visibility') == 'public')
+
+        if (this.model.description.has('body_html')) {
+            this.$('.description .usertext-body').html(
+                this.model.description.get('body_html')
+            )
+        }
+
+        this.$('.count').text(this.model.subreddits.length)
+
+        return this
     },
 
     setVisibility: function() {
@@ -465,6 +515,13 @@ r.multi.SubscribeButton = Backbone.View.extend({
             group: this.options.bubbleGroup,
             srName: String(this.$el.data('sr_name'))
         })
+
+        var bubbleClass = this.$el.data('bubble_class')
+        if (bubbleClass) {
+            this.bubble.$el.removeClass('anchor-right')
+            this.bubble.$el.addClass(bubbleClass)
+        }
+
         this.bubble.queueShow()
     }
 })
@@ -609,6 +666,12 @@ r.multi.ListingChooser = Backbone.View.extend({
     initialize: function() {
         this.$el.addClass('initialized')
 
+        // transition collapsed state to server pref
+        if (store.safeGet('ui.collapse.listingchooser') == true) {
+            this.toggleCollapsed(true)
+        }
+        store.safeSet('ui.collapse.listingchooser')
+
         // HACK: fudge page heights for long lists of multis / short pages
         var thisHeight = this.$('.contents').height(),
             bodyHeight = $('body').height()
@@ -629,8 +692,14 @@ r.multi.ListingChooser = Backbone.View.extend({
         }
     },
 
-    toggleCollapsed: function() {
-        $('body').toggleClass('listing-chooser-collapsed')
-        store.set('ui.collapse.listingchooser', $('body').is('.listing-chooser-collapsed'))
+    toggleCollapsed: function(value) {
+        $('body').toggleClass('listing-chooser-collapsed', value)
+        Backbone.ajax({
+            type: 'POST',
+            url: '/api/set_left_bar_collapsed.json',
+            data: {
+                'collapsed': $('body').is('.listing-chooser-collapsed')
+            }
+        })
     }
 })

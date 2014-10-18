@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -44,38 +44,20 @@
 </%def>
 
 <%def name="global_stylesheets()">
-  %if c.lang_rtl:
-    <link rel="stylesheet" href="${static(g.stylesheet_rtl)}"
-          type="text/css" />
-    %if c.site.stylesheet_rtl:
-      <link rel="stylesheet" href="${static(c.site.stylesheet_rtl)}"
-            type="text/css" />
-    %endif
-  %else:
-    ${less_stylesheet(g.stylesheet)}
-    %if c.site.stylesheet:
-    <link rel="stylesheet" href="${static(c.site.stylesheet)}"
-          type="text/css" >
-    %endif
+  ${less_stylesheet("reddit.less")}
+  %if c.site.stylesheet:
+    <link rel="stylesheet" href="${static(c.site.stylesheet)}" type="text/css" >
   %endif
-
-  <!--[if lt IE 7]>
-    <link rel="stylesheet" href="${static('reddit-ie6-hax.css')}"
-          type="text/css" />
-  <![endif]-->
-
-  <!--[if lt IE 8]>
-    <link rel="stylesheet" href="${static('reddit-ie7-hax.css')}"
-          type="text/css" />
-  <![endif]-->
 </%def>
 
 <%def name="sr_stylesheets()">
-  %if c.can_apply_styles and c.allow_styles and c.site.stylesheet_hash:
+  %if thing.subreddit_stylesheet_url:
+    <!--[if gte IE 8]> <!-->
     <link rel="stylesheet"
-          href="${c.site.stylesheet_url}"
+          href="${thing.subreddit_stylesheet_url}"
           title="applied_subreddit_stylesheet"
           type="text/css">
+    <!-- <![endif]-->
   %endif
 </%def>
 
@@ -89,6 +71,18 @@
 <%def name="pagemeta()">
   %if hasattr(thing, "shortlink"):
     <link rel="shorturl" href="http://${thing.shortlink}"/>
+  %endif
+
+  %if hasattr(thing, "og_data"):
+    %for (og_property, og_value) in thing.og_data.iteritems():
+      <meta property="og:${og_property}" content="${og_value}">
+    %endfor
+  %endif
+
+  %if hasattr(thing, "twitter_card"):
+    %for (twitter_card_property, twitter_card_value) in thing.twitter_card.iteritems():
+      <meta property="twitter:${twitter_card_property}" content="${twitter_card_value}">
+    %endfor
   %endif
 
   <link rel='icon' href="${static('icon.png')}" sizes="256x256" type="image/png" />
@@ -113,12 +107,12 @@
 
 <%def name="javascript()">
   <% from r2.lib import js %>
-  ${unsafe(js.use('jquery', 'reddit-init'))}
-  % if c.deny_frames:
-    <script>if (window != top) top.location = window.location</script>
-  % endif
+  <!--[if gte IE 9]> <!-->
+    ${unsafe(js.use('jquery2x', 'reddit-init'))}
+  <!-- <![endif]-->
+
   <!--[if lt IE 9]>
-    ${unsafe(js.use('html5shiv'))}
+    ${unsafe(js.use('html5shiv', 'jquery1x', 'reddit-init'))}
   <![endif]-->
   ${less_js()}
 </%def>
@@ -149,8 +143,8 @@
 
   <% content = getattr(self, "content", None) or thing.content %>
   %if content:
-    ##<div class="fixedwidth"><!--IE6sux--></div>
-    ##<div class="clearleft"><!--IE6sux--></div>
+    ##<div class="fixedwidth"></div>
+    ##<div class="clearleft"></div>
     <a name="content"></a>
     <div ${tags(id=thing.content_id)} ${classes("content", thing.css_class)} role="main">
       ${content()}
@@ -186,7 +180,7 @@
     %endif
   %endif
   ${framebuster()}
-  <p class="bottommenu debuginfo"><span class="icon">&pi;</span>&nbsp;<span class="content">Rendered by PID ${g.reddit_pid} on ${g.reddit_host} at ${c.start_time} running ${g.short_version}.</span></p>
+  ${thing.debug_footer}
 </%def>
 
 <%def name="sidebar(content=None)">

@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -59,8 +59,7 @@
    %>
   <div class="entry ${like_cls}">
     <div class="tagline">
-     ${WrappedUser(thing.author, thing.attribs, thing,
-                   gray = collapse).render()}&#32;
+     ${WrappedUser(thing.author, thing.attribs, thing, gray=collapse)}&#32;
      %if thing.score_hidden:
        [${_("score hidden")}]
      %else:
@@ -68,9 +67,9 @@
      %endif
      &#32;
      ## thing.timesince is a cache stub
-     ${unsafe(_("%(timeago)s ago") % dict(timeago=thing.timesince))}
+     ${unsafe(_("%(timeago)s") % dict(timeago=thing.timesince))}
      % if thing.gilded_message:
-       <span class="gilded-comment-icon" title="${thing.gilded_message}" data-count="${thing.gildings}">
+       <span class="gilded-icon" title="${thing.gilded_message}" data-count="${thing.gildings}">
          % if thing.gildings > 1:
            x${thing.gildings}
          % endif
@@ -98,8 +97,15 @@
             %endif
         </div>
   </div>
-  <div style="clear: both"></div>
-  <div class="child">
-    ${thing.childlisting}
-  </div>
+  <div class="commentspacer"></div>
+  %if thing.link.contest_mode and hasattr(thing, "child") and not thing.parent_id:
+    <button class="showreplies newbutton"
+        onclick="$(this).hide();$(this).parent().find('.noncollapsed').show();return false;">
+        ${_("show replies")}
+    </button>
+    <div class="child noncollapsed" style="display:none">
+  %else:
+    <div class="child">
+  %endif
+  ${thing.childlisting}</div>
 </div>

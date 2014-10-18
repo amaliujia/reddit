@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2012 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -25,11 +25,8 @@ from pylons.i18n import _
 
 from r2.config.extensions import set_extension
 from r2.controllers.api_docs import api_doc, api_section
-from r2.controllers.reddit_base import RedditController
-from r2.controllers.oauth2 import (
-    OAuth2ResourceController,
-    require_oauth2_scope,
-)
+from r2.controllers.reddit_base import RedditController, abort_with_error
+from r2.controllers.oauth2 import require_oauth2_scope
 from r2.models.account import Account
 from r2.models.subreddit import (
     FakeSubreddit,
@@ -47,7 +44,7 @@ from r2.lib.validator import (
     VSubredditName,
     VSRByName,
     VValidatedJSON,
-    VMarkdown,
+    VMarkdownLength,
     VMultiPath,
     VMultiByPath,
 )
@@ -56,8 +53,7 @@ from r2.lib.jsontemplates import (
     LabeledMultiJsonTemplate,
     LabeledMultiDescriptionJsonTemplate,
 )
-from r2.lib.errors import errors, reddit_http_error, RedditError
-from r2.lib.base import abort
+from r2.lib.errors import errors, RedditError
 
 
 multi_sr_data_json_spec = VValidatedJSON.Object({
@@ -72,26 +68,16 @@ multi_json_spec = VValidatedJSON.Object({
 
 
 multi_description_json_spec = VValidatedJSON.Object({
-    'body_md': VMarkdown('body_md', empty_error=None),
+    'body_md': VMarkdownLength('body_md', max_length=10000, empty_error=None),
 })
 
 
-class MultiApiController(RedditController, OAuth2ResourceController):
+class MultiApiController(RedditController):
+    on_validation_error = staticmethod(abort_with_error)
+
     def pre(self):
         set_extension(request.environ, "json")
-        self.check_for_bearer_token()
         RedditController.pre(self)
-
-    def on_validation_error(self, error):
-        if not error.code:
-            raise ValueError('Error %r missing status code' % error)
-
-        abort(reddit_http_error(
-            code=error.code,
-            error_name=error.name,
-            explanation=error.message,
-            fields=error.fields,
-        ))
 
     @require_oauth2_scope("read")
     @validate(VUser())
@@ -112,6 +98,7 @@ class MultiApiController(RedditController, OAuth2ResourceController):
     @api_doc(
         api_section.multis,
         uri="/api/multi/{multipath}",
+        uri_variants=['/api/filter/{filterpath}'],
     )
     def GET_multi(self, multi):
         """Fetch a multi's data and subreddit list by name."""
@@ -239,7 +226,7 @@ class MultiApiController(RedditController, OAuth2ResourceController):
     @validate(
         VUser(),
         VModhash(),
-        from_multi=VMultiByPath("from", require_view=True),
+        from_multi=VMultiByPath("from", require_view=True, kinds='m'),
         to_path_info=VMultiPath("to",
             docs={"to": "destination multireddit url path"},
         ),
@@ -274,7 +261,7 @@ class MultiApiController(RedditController, OAuth2ResourceController):
     @validate(
         VUser(),
         VModhash(),
-        from_multi=VMultiByPath("from", require_edit=True),
+        from_multi=VMultiByPath("from", require_edit=True, kinds='m'),
         to_path_info=VMultiPath("to",
             docs={"to": "destination multireddit url path"},
         ),
@@ -303,6 +290,7 @@ class MultiApiController(RedditController, OAuth2ResourceController):
     @api_doc(
         api_section.multis,
         uri="/api/multi/{multipath}/r/{srname}",
+        uri_variants=['/api/filter/{filterpath}/r/{srname}'],
     )
     def GET_multi_subreddit(self, multi, sr):
         """Get data about a subreddit in a multi."""
@@ -352,7 +340,7 @@ class MultiApiController(RedditController, OAuth2ResourceController):
     @require_oauth2_scope("read")
     @validate(
         VUser(),
-        multi=VMultiByPath("multipath", require_view=True),
+        multi=VMultiByPath("multipath", require_view=True, kinds='m'),
     )
     @api_doc(
         api_section.multis,
@@ -365,7 +353,8 @@ class MultiApiController(RedditController, OAuth2ResourceController):
     @require_oauth2_scope("read")
     @validate(
         VUser(),
-        multi=VMultiByPath("multipath", require_edit=True),
+        VModhash(),
+        multi=VMultiByPath("multipath", require_edit=True, kinds='m'),
         data=VValidatedJSON('model', multi_description_json_spec),
     )
     @api_doc(api_section.multis, extends=GET_multi_description)

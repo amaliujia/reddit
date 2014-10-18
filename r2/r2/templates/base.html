@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -28,11 +28,12 @@
 %>
 <%namespace file="utils.html" import="js_setup, googleanalytics, classes"/>
 <html xmlns="http://www.w3.org/1999/xhtml" lang="${c.lang}" 
-      xml:lang="${c.lang}" ${c.lang_rtl and unsafe('dir="rtl"') or ''}>
+      xml:lang="${c.lang}">
   <head>
     <title>${self.Title()}</title>
     <meta name="keywords" content="${self.keywords()}" />
     <meta name="description" content="${getattr(thing, 'short_description', None) or g.short_description}" />
+    <meta name="referrer" content="${c.referrer_policy}">
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
     ${self.viewport()}
     ${self.robots()}
@@ -83,7 +84,7 @@ reddit, reddit.com, vote, comment, submit
 </%def>
 
 <%def name="head()">
-%if g.tracker_url and thing.site_tracking and not c.secure:
+%if g.tracker_url and thing.site_tracking:
 <script type="text/javascript">
     (function() {
         var url = '${tracking.get_pageview_pixel_url()}';

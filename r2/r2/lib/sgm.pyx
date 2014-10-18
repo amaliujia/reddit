@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -69,6 +69,6 @@ def sgm(cache, keys, miss_fn, str prefix='', int time=0, stale=False, found_fn=N
         calculated_to_cache = {}
         for k, v in calculated.iteritems():
             calculated_to_cache[str(k)] = v
-        cache.set_multi(calculated_to_cache, prefix=prefix)
+        cache.set_multi(calculated_to_cache, prefix=prefix, time=time)
 
     return ret

@@ -17,50 +17,52 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 ###############################################################################
-# The reddit installer
-# --------------------
-# This script installs a reddit stack suitable for development. DO NOT run
-# this on a system that you use for other purposes as it may accidentally
-# an important file.
+# reddit dev environment installer
+# --------------------------------
+# This script installs a reddit stack suitable for development. DO NOT run this
+# on a system that you use for other purposes as it might delete important
+# files, truncate your databases, and otherwise do mean things to you.
 #
-# You can run this script as is, in which case a user "reddit" will be created
-# and the code will be placed in its home directory. The various reddit-code
-# components of the stack will run as this user.
+# By default, this script will install the reddit code in the current user's
+# home directory and all of its dependencies (including libraries and database
+# servers) at the system level. The installed reddit will expect to be visited
+# on the domain "reddit.local" unless specified otherwise.  Configuring name
+# resolution for the domain is expected to be done outside the installed
+# environment (e.g. in your host machine's /etc/hosts file) and is not
+# something this script handles.
 #
-# To change aspects of the install, modify the variables in the "Configuration"
-# section below.
+# Several configuration options (listed in the "Configuration" section below)
+# are overridable with environment variables. e.g.
+#
+#    sudo REDDIT_DOMAIN=example.com ./install-reddit.sh
+#
 ###############################################################################
 set -e
 
 ###############################################################################
 # Configuration
 ###############################################################################
+# which user to install the code for; defaults to the user invoking this script
+REDDIT_USER=${REDDIT_USER:-$SUDO_USER}
 
-# which user should run the reddit code
-REDDIT_USER=reddit
+# the group to run reddit code as; must exist already
+REDDIT_GROUP=${REDDIT_GROUP:-nogroup}
 
-# the group to run reddit code as
-REDDIT_GROUP=nogroup
-
-# the root directory in which to install the reddit code
-REDDIT_HOME=/home/$REDDIT_USER
-
-# which user should own the installed reddit files
-# NOTE: if you change this option, you should move the mako template
-# cache directory by changing the "cache_dir" option in the [app:main]
-# section of the update files as $REDDIT_HOME will most likely
-# not be writable by the reddit user.
-REDDIT_OWNER=reddit
+# the root directory to base the install in. must exist already
+REDDIT_HOME=${REDDIT_HOME:-/home/$REDDIT_USER}
 
 # the domain that you will connect to your reddit install with.
 # MUST contain a . in it somewhere as browsers won't do cookies for dotless
 # domains. an IP address will suffice if nothing else is available.
 REDDIT_DOMAIN=${REDDIT_DOMAIN:-reddit.local}
+
+#The plugins to clone and register in the ini file
+REDDIT_PLUGINS=${REDDIT_PLUGINS:-meatspace about liveupdate}
 
 ###############################################################################
 # Sanity Checks
@@ -70,7 +72,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# seriously! these checks aren't here for no reason. the packages from the
+# seriously! these checks are here for a reason. the packages from the
 # reddit ppa aren't built for anything but precise (12.04) right now, so
 # if you try and use this install script on another release you're gonna
 # have a bad time.
@@ -85,13 +87,8 @@ fi
 ###############################################################################
 set -x
 
-# create the user if non-existent
-if ! id $REDDIT_USER &> /dev/null; then
-    adduser --system $REDDIT_USER
-fi
-
 # aptitude configuration
-APTITUDE_OPTIONS="-y" # limit bandwidth: -o Acquire::http::Dl-Limit=100"
+APTITUDE_OPTIONS="-y"
 export DEBIAN_FRONTEND=noninteractive
 
 # run an aptitude update to make sure python-software-properties
@@ -115,6 +112,7 @@ apt-get update
 
 # install prerequisites
 cat <<PACKAGES | xargs apt-get install $APTITUDE_OPTIONS
+netcat-openbsd
 git-core
 
 python-dev
@@ -128,10 +126,8 @@ python-babel
 cython
 python-sqlalchemy
 python-beautifulsoup
-python-cssutils
 python-chardet
 python-psycopg2
-python-pycountry
 python-pycassa
 python-imaging
 python-pycaptcha
@@ -144,8 +140,16 @@ python-lxml
 python-zope.interface
 python-kazoo
 python-stripe
+python-tinycss2
+
+python-flask
+geoip-bin
+geoip-database
+python-geoip
 
 nodejs
+node-less
+node-uglify
 gettext
 make
 optipng
@@ -157,12 +161,19 @@ postgresql-client
 rabbitmq-server
 cassandra
 haproxy
+nginx
+stunnel
+gunicorn
+sutro
 PACKAGES
+
+# paper over stack size issues with cassandra
+sed -i s/-Xss128k/-Xss228k/ /etc/cassandra/cassandra-env.sh
 
 ###############################################################################
 # Wait for all the services to be up
 ###############################################################################
-# cassandra no longer auto-starts
+# cassandra doesn't auto-start after install
 service cassandra start
 
 # check each port for connectivity
@@ -180,20 +191,33 @@ done
 ###############################################################################
 # Install the reddit source repositories
 ###############################################################################
-if [ ! -d $REDDIT_HOME ]; then
-    mkdir -p $REDDIT_HOME
-    chown $REDDIT_OWNER $REDDIT_HOME
+if [ ! -d $REDDIT_HOME/src ]; then
+    mkdir -p $REDDIT_HOME/src
+    chown $REDDIT_USER $REDDIT_HOME/src
 fi
 
-cd $REDDIT_HOME
+function clone_reddit_repo {
+    local destination=$REDDIT_HOME/src/${1}
+    local repository_url=https://github.com/${2}.git
 
-if [ ! -d $REDDIT_HOME/reddit ]; then
-    sudo -u $REDDIT_OWNER git clone https://github.com/reddit/reddit.git
-fi
+    if [ ! -d $destination ]; then
+        sudo -u $REDDIT_USER git clone $repository_url $destination
+    fi
 
-if [ ! -d $REDDIT_HOME/reddit-i18n ]; then
-    sudo -u $REDDIT_OWNER git clone https://github.com/reddit/reddit-i18n.git
-fi
+    if [ -d $destination/upstart ]; then
+        cp $destination/upstart/* /etc/init/
+    fi
+}
+
+function clone_reddit_plugin_repo {
+    clone_reddit_repo $1 reddit/reddit-plugin-$1
+}
+
+clone_reddit_repo reddit reddit/reddit
+clone_reddit_repo i18n reddit/reddit-i18n
+for plugin in $REDDIT_PLUGINS; do
+    clone_reddit_plugin_repo $plugin
+done
 
 ###############################################################################
 # Configure Cassandra
@@ -215,12 +239,12 @@ IS_DATABASE_CREATED=$(sudo -u postgres psql -t -c "$SQL")
 
 if [ $IS_DATABASE_CREATED -ne 1 ]; then
     cat <<PGSCRIPT | sudo -u postgres psql
-CREATE DATABASE reddit WITH ENCODING = 'utf8' TEMPLATE template0;
+CREATE DATABASE reddit WITH ENCODING = 'utf8' TEMPLATE template0 LC_COLLATE='en_US.utf8' LC_CTYPE='en_US.utf8';
 CREATE USER reddit WITH PASSWORD 'password';
 PGSCRIPT
 fi
 
-sudo -u postgres psql reddit < $REDDIT_HOME/reddit/sql/functions.sql
+sudo -u postgres psql reddit < $REDDIT_HOME/src/reddit/sql/functions.sql
 
 ###############################################################################
 # Configure RabbitMQ
@@ -240,23 +264,29 @@ rabbitmqctl set_permissions -p / reddit ".*" ".*" ".*"
 ###############################################################################
 # Install and configure the reddit code
 ###############################################################################
-cd $REDDIT_HOME/reddit/r2
-sudo -u $REDDIT_OWNER make pyx # generate the .c files from .pyx
-sudo -u $REDDIT_OWNER python setup.py build
-python setup.py develop
+function install_reddit_repo {
+    cd $REDDIT_HOME/src/$1
+    sudo -u $REDDIT_USER python setup.py build
+    python setup.py develop --no-deps
+}
 
-cd $REDDIT_HOME/reddit-i18n/
-sudo -u $REDDIT_OWNER python setup.py build
-python setup.py develop
-sudo -u $REDDIT_OWNER make
+install_reddit_repo reddit/r2
+install_reddit_repo i18n
+for plugin in $REDDIT_PLUGINS; do
+    install_reddit_repo $plugin
+done
+
+# generate binary translation files from source
+cd $REDDIT_HOME/src/i18n/
+sudo -u $REDDIT_USER make clean all
 
 # this builds static files and should be run *after* languages are installed
-# so that the proper language-specific static files can be generated.
-cd $REDDIT_HOME/reddit/r2
-sudo -u $REDDIT_OWNER make
+# so that the proper language-specific static files can be generated and after
+# plugins are installed so all the static files are available.
+cd $REDDIT_HOME/src/reddit/r2
+sudo -u $REDDIT_USER make clean all
 
-cd $REDDIT_HOME/reddit/r2
-
+plugin_str=$(echo -n "$REDDIT_PLUGINS" | tr " " ,)
 if [ ! -f development.update ]; then
     cat > development.update <<DEVELOPMENT
 # after editing this file, run "make ini" to
@@ -272,41 +302,70 @@ disable_require_admin_otp = true
 
 page_cache_time = 0
 
-set debug = true
-
 domain = $REDDIT_DOMAIN
+
+plugins = $plugin_str
+
+media_provider = filesystem
+media_fs_root = /srv/www/media
+media_fs_base_url_http = http://%(domain)s/media/
+media_fs_base_url_https = https://%(domain)s/media/
 
 [server:main]
 port = 8001
 DEVELOPMENT
-    chown $REDDIT_OWNER development.update
+    chown $REDDIT_USER development.update
+else
+    sed -i "s/^plugins = .*$/plugins = $plugin_str/" $REDDIT_HOME/src/reddit/r2/development.update
+    sed -i "s/^domain = .*$/domain = $REDDIT_DOMAIN/" $REDDIT_HOME/src/reddit/r2/development.update
 fi
 
-if [ ! -f production.update ]; then
-    cat > production.update <<PRODUCTION
-# after editing this file, run "make ini" to
-# generate a new production.ini
-
-[DEFAULT]
-debug = false
-reload_templates = false
-uncompressedJS = false
-
-set debug = false
-
-domain = $REDDIT_DOMAIN
-
-[server:main]
-port = 8001
-PRODUCTION
-    chown $REDDIT_OWNER production.update
-fi
-
-sudo -u $REDDIT_OWNER make ini
+sudo -u $REDDIT_USER make ini
 
 if [ ! -L run.ini ]; then
-    sudo -u $REDDIT_OWNER ln -s development.ini run.ini
+    sudo -u $REDDIT_USER ln -nsf development.ini run.ini
 fi
+
+###############################################################################
+# some useful helper scripts
+###############################################################################
+cat > /usr/local/bin/reddit-run <<REDDITRUN
+#!/bin/bash
+exec paster --plugin=r2 run $REDDIT_HOME/src/reddit/r2/run.ini "\$@"
+REDDITRUN
+
+cat > /usr/local/bin/reddit-shell <<REDDITSHELL
+#!/bin/bash
+exec paster --plugin=r2 shell $REDDIT_HOME/src/reddit/r2/run.ini
+REDDITSHELL
+
+chmod 755 /usr/local/bin/reddit-run /usr/local/bin/reddit-shell
+
+###############################################################################
+# nginx
+###############################################################################
+
+mkdir -p /srv/www/media
+chown $REDDIT_USER:$REDDIT_GROUP /srv/www/media
+
+cat > /etc/nginx/sites-available/reddit-media <<MEDIA
+server {
+    listen 9000;
+
+    expires max;
+
+    location /media/ {
+        alias /srv/www/media/;
+    }
+}
+MEDIA
+
+# remove the default nginx site that may conflict with haproxy
+rm -rf /etc/nginx/sites-enabled/default
+# put our config in place
+ln -nsf /etc/nginx/sites-available/reddit-media /etc/nginx/sites-enabled/
+
+service nginx restart
 
 ###############################################################################
 # haproxy
@@ -325,17 +384,34 @@ DEFAULT
 # configure haproxy
 cat > /etc/haproxy/haproxy.cfg <<HAPROXY
 global
-    maxconn 100
+    maxconn 350
 
-frontend frontend 0.0.0.0:80
+frontend frontend
     mode http
-    timeout client 10000
+
+    bind 0.0.0.0:80
+    bind 127.0.0.1:8080
+
+    timeout client 24h
     option forwardfor except 127.0.0.1
     option httpclose
 
-    default_backend dynamic
+    # make sure that requests have x-forwarded-proto: https iff tls
+    reqidel ^X-Forwarded-Proto:.*
+    acl is-ssl dst_port 8080
+    reqadd X-Forwarded-Proto:\ https if is-ssl
 
-backend dynamic
+    # send websockets to sutro
+    acl is-websocket hdr(Upgrade) -i WebSocket
+    use_backend sutro if is-websocket
+
+    # send media stuff to the local nginx
+    acl is-media path_beg /media/
+    use_backend media if is-media
+
+    default_backend reddit
+
+backend reddit
     mode http
     timeout connect 4000
     timeout server 30000
@@ -343,26 +419,183 @@ backend dynamic
     balance roundrobin
 
     server app01-8001 localhost:8001 maxconn 1
+
+backend sutro
+    mode http
+    timeout connect 4s
+    timeout server 24h
+    balance roundrobin
+
+    server sutro localhost:8002 maxconn 250
+
+backend media
+    mode http
+    timeout connect 4000
+    timeout server 30000
+    timeout queue 60000
+    balance roundrobin
+
+    server nginx localhost:9000 maxconn 20
 HAPROXY
 
 # this will start it even if currently stopped
 service haproxy restart
 
 ###############################################################################
-# Upstart Environment
+# stunnel
+###############################################################################
+cat > /etc/stunnel/stunnel.conf <<STUNNELCONF
+foreground = no
+
+; replace these with real certificates
+cert = /etc/ssl/certs/ssl-cert-snakeoil.pem
+key = /etc/ssl/private/ssl-cert-snakeoil.key
+
+; protocol version and ciphers
+sslVersion = all
+ciphers = ECDHE-RSA-RC4-SHA:ECDHE-ECDSA-RC4-SHA:ECDH-RSA-RC4-SHA:ECDH-ECDSA-RC4-SHA:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:SRP-DSS-AES-256-CBC-SHA:SRP-RSA-AES-256-CBC-SHA:DHE-DSS-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA256:DHE-RSA-AES256-SHA:DHE-DSS-AES256-SHA:DHE-RSA-CAMELLIA256-SHA:DHE-DSS-CAMELLIA256-SHA:ECDH-RSA-AES256-GCM-SHA384:ECDH-ECDSA-AES256-GCM-SHA384:ECDH-RSA-AES256-SHA384:ECDH-ECDSA-AES256-SHA384:ECDH-RSA-AES256-SHA:ECDH-ECDSA-AES256-SHA:AES256-GCM-SHA384:AES256-SHA256:AES256-SHA:CAMELLIA256-SHA:PSK-AES256-CBC-SHA:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:SRP-DSS-AES-128-CBC-SHA:SRP-RSA-AES-128-CBC-SHA:DHE-DSS-AES128-GCM-SHA256:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES128-SHA256:DHE-DSS-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA:DHE-RSA-SEED-SHA:DHE-DSS-SEED-SHA:DHE-RSA-CAMELLIA128-SHA:DHE-DSS-CAMELLIA128-SHA:ECDH-RSA-AES128-GCM-SHA256:ECDH-ECDSA-AES128-GCM-SHA256:ECDH-RSA-AES128-SHA256:ECDH-ECDSA-AES128-SHA256:ECDH-RSA-AES128-SHA:ECDH-ECDSA-AES128-SHA:AES128-GCM-SHA256:AES128-SHA256:AES128-SHA:SEED-SHA:CAMELLIA128-SHA:PSK-AES128-CBC-SHA:RC4-SHA:DES-CBC3-SHA:RC4-MD5
+options = NO_SSLv2
+options = DONT_INSERT_EMPTY_FRAGMENTS
+options = CIPHER_SERVER_PREFERENCE
+
+; security
+chroot = /var/lib/stunnel4/
+setuid = stunnel4
+setgid = stunnel4
+pid = /stunnel4.pid
+
+; performance
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+
+; logging
+output = /var/log/stunnel4/stunnel.log
+syslog = no
+
+[https]
+accept = 443
+connect = 8080
+TIMEOUTclose = 0
+sslVersion = all
+; this requires a patched version of stunnel which is in the reddit ppa
+xforwardedfor = yes
+STUNNELCONF
+
+sed -i s/ENABLED=0/ENABLED=1/ /etc/default/stunnel4
+
+service stunnel4 restart
+
+###############################################################################
+# sutro (websocket server)
+###############################################################################
+
+if [ ! -f /etc/sutro.ini ]; then
+    cat > /etc/sutro.ini <<SUTRO
+[app:main]
+paste.app_factory = sutro.app:make_app
+
+amqp.host = localhost
+amqp.port = 5672
+amqp.vhost = /
+amqp.username = reddit
+amqp.password = reddit
+
+web.allowed_origins = $REDDIT_DOMAIN
+web.mac_secret = YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU2Nzg5
+web.ping_interval = 300
+
+stats.host =
+stats.port = 0
+
+[server:main]
+use = egg:gunicorn#main
+worker_class = sutro.socketserver.SutroWorker
+workers = 1
+worker_connections = 250
+host = 127.0.0.1
+port = 8002
+graceful_timeout = 5
+forward_allow_ips = 127.0.0.1
+
+[loggers]
+keys = root
+
+[handlers]
+keys = syslog
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = INFO
+handlers = syslog
+
+[handler_syslog]
+class = handlers.SysLogHandler
+args = ("/dev/log", "local7")
+formatter = generic
+level = NOTSET
+
+[formatter_generic]
+format = [%(name)s] %(message)s
+SUTRO
+fi
+
+if [ ! -f /etc/init/sutro.conf ]; then
+    cat > /etc/init/sutro.conf << UPSTART_SUTRO
+description "sutro websocket server"
+
+stop on runlevel [!2345]
+start on runlevel [2345]
+
+respawn
+respawn limit 10 5
+kill timeout 15
+
+limit nofile 65535 65535
+
+exec gunicorn_paster /etc/sutro.ini
+UPSTART_SUTRO
+fi
+
+service sutro restart
+
+###############################################################################
+# geoip service
+###############################################################################
+if [ ! -f /etc/gunicorn.d/geoip.conf ]; then
+    cat > /etc/gunicorn.d/geoip.conf <<GEOIP
+CONFIG = {
+    "mode": "wsgi",
+    "working_dir": "$REDDIT_HOME/src/reddit/scripts",
+    "user": "$REDDIT_USER",
+    "group": "$REDDIT_USER",
+    "args": (
+        "--bind=127.0.0.1:5000",
+        "--workers=1",
+         "--limit-request-line=8190",
+         "geoip_service:application",
+    ),
+}
+GEOIP
+fi
+
+service gunicorn start
+
+###############################################################################
+# Job Environment
 ###############################################################################
 CONSUMER_CONFIG_ROOT=$REDDIT_HOME/consumer-count.d
-cp $REDDIT_HOME/reddit/upstart/* /etc/init/
 
 if [ ! -f /etc/default/reddit ]; then
     cat > /etc/default/reddit <<DEFAULT
-export REDDIT_ROOT=$REDDIT_HOME/reddit/r2
-export REDDIT_INI=$REDDIT_HOME/reddit/r2/run.ini
+export REDDIT_ROOT=$REDDIT_HOME/src/reddit/r2
+export REDDIT_INI=$REDDIT_HOME/src/reddit/r2/run.ini
 export REDDIT_USER=$REDDIT_USER
 export REDDIT_GROUP=$REDDIT_GROUP
 export REDDIT_CONSUMER_CONFIG=$CONSUMER_CONFIG_ROOT
-alias wrap-job=$REDDIT_HOME/reddit/scripts/wrap-job
-alias manage-consumers=$REDDIT_HOME/reddit/scripts/manage-consumers
+alias wrap-job=$REDDIT_HOME/src/reddit/scripts/wrap-job
+alias manage-consumers=$REDDIT_HOME/src/reddit/scripts/manage-consumers
 DEFAULT
 fi
 
@@ -379,12 +612,16 @@ function set_consumer_count {
 
 set_consumer_count log_q 0
 set_consumer_count cloudsearch_q 0
-set_consumer_count scraper_q 0
+set_consumer_count scraper_q 1
+set_consumer_count markread_q 1
 set_consumer_count commentstree_q 1
 set_consumer_count newcomments_q 1
 set_consumer_count vote_link_q 1
 set_consumer_count vote_comment_q 1
 
+chown -R $REDDIT_USER:$REDDIT_GROUP $CONSUMER_CONFIG_ROOT/
+
+initctl emit reddit-stop
 initctl emit reddit-start
 
 ###############################################################################
@@ -396,12 +633,20 @@ if [ ! -f /etc/cron.d/reddit ]; then
 30  16 * * * root /sbin/start --quiet reddit-job-update_reddits
 0    * * * * root /sbin/start --quiet reddit-job-update_promos
 */5  * * * * root /sbin/start --quiet reddit-job-clean_up_hardcache
-*    * * * * root /sbin/start --quiet reddit-job-email
 */2  * * * * root /sbin/start --quiet reddit-job-broken_things
 */2  * * * * root /sbin/start --quiet reddit-job-rising
+0    * * * * root /sbin/start --quiet reddit-job-trylater
+
+# liveupdate
+*    * * * * root /sbin/start --quiet reddit-job-liveupdate_activity
+
+# jobs that recalculate time-limited listings (e.g. top this year)
+PGPASSWORD=password
+*/15 * * * * $REDDIT_USER $REDDIT_HOME/src/reddit/scripts/compute_time_listings link year '("hour", "day", "week", "month", "year")'
+*/15 * * * * $REDDIT_USER $REDDIT_HOME/src/reddit/scripts/compute_time_listings comment year '("hour", "day", "week", "month", "year")'
 
 # disabled by default, uncomment if you need these jobs
-#*/2  * * * * root /sbin/start --quiet reddit-job-google_checkout
+#*    * * * * root /sbin/start --quiet reddit-job-email
 #0    0 * * * root /sbin/start --quiet reddit-job-update_gold_users
 CRON
 fi
@@ -442,8 +687,8 @@ steps:
 
 * To populate the database with test data, run:
 
-    cd $REDDIT_HOME/reddit/r2
-    paster run run.ini r2/models/populatedb.py -c 'populate()'
+    cd $REDDIT_HOME/src/reddit/r2
+    reddit-run r2/models/populatedb.py -c 'populate()'
 
 * Manually run reddit-job-update_reddits immediately after populating the db
   or adding your own subreddits.

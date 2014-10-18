@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -41,6 +41,10 @@ function getrval(r) {
     for (var i=0; i < r.length; i++) {
         if (r[i].checked) return r[i].value;
     } 
+}
+
+function showPreview(val) {
+  $("#previewbox").html(val)
 }
 
 function update() {
@@ -95,7 +99,7 @@ function update() {
                       escapeHTML(url).replace(/&amp;/g, '&') + 
                       '" type="text/javascript"><'+'/script>';
     $("#codebox").html(escapeHTML(script));
-    $.getScript(url+'&callback=' + encodeURIComponent('$("#previewbox").html'));
+    $.getScript(url+'&callback=showPreview');
                       
     }
 </script>

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -97,19 +97,11 @@ string_dict = dict(
     searching_a_reddit = _('you\'re searching within the [%(reddit_name)s](%(reddit_link)s) subreddit. '+
                            'you can also search within [all subreddits](%(all_reddits_link)s)'),
 
-    css_validator_messages = dict(
-        broken_url = _('"%(brokenurl)s" is not a valid URL'),
-        invalid_property = _('"%(cssprop)s" is not a valid CSS property'),
-        invalid_val_for_prop = _('"%(cssvalue)s" is not a valid value for CSS property "%(cssprop)s"'),
-        too_big = _('too big. keep it under %(max_size)dkb'),
-        max_size = _('max size: %(max_size)dkB'),
-        syntax_error = _('syntax error: "%(syntaxerror)s"'),
-        no_imports = _('@imports are not allowed'),
-        invalid_property_list = _('invalid CSS property list "%(proplist)s"'),
-        unknown_rule_type = _('unknown CSS rule type "%(ruletype)s"')
-    ),
     permalink_title = _("%(author)s comments on %(title)s"),
     link_info_title = _("%(title)s : %(site)s"),
+    link_info_og_description = _("%(score)s points and %(num_comments)s comments so far on reddit"),
+
+
     banned_subreddit_title = _("this subreddit has been banned"),
     banned_subreddit_message = _("most likely this was done automatically by our spam filtering program. the program is still learning, and may even have some bugs, so if you feel the ban was a mistake, please submit a link to our [request a subreddit listing](%(link)s) and be sure to include the **exact name of the subreddit**."),
     private_subreddit_title = _("this subreddit is private"),
@@ -123,8 +115,9 @@ string_dict = dict(
     compact_suggest = _("Looks like you're browsing on a small screen. Would you like to try [reddit's mobile interface](%(url)s)?"),
     verify_email = _("we're going to need to verify your email address for you to proceed."),
     verify_email_submit = _("you'll be able to submit more frequently once you verify your email address"),
-    email_verified =  _("your email address has been verfied"),
+    email_verified =  _("your email address has been verified"),
     email_verify_failed = _("Verification failed.  Please try that again"),
+    email_verify_wrong_user = _("The email verification link you've followed is for a different user. Please log out and switch to that user or try again below."),
     search_failed = _("Our search machines are under too much load to handle your request right now. :( Sorry for the inconvenience. Try again in a little bit -- but please don't mash reload; that only makes the problem worse."),
     invalid_search_query = _("I couldn't understand your query, so I simplified it and searched for \"%(clean_query)s\" instead."),
     completely_invalid_search_query = _("I couldn't understand your search query. Please try again."),
@@ -135,22 +128,26 @@ string_dict = dict(
     unverified_quota_msg = _("Looks like you're either a brand new user or your posts have not been doing well recently. You may have to wait a bit to post again. In the meantime feel free to [check out the reddiquette](%(reddiquette)s), join the conversation in a different thread, or [verify your email address](%(verify)s)."),
     read_only_msg = _("reddit is in \"emergency read-only mode\" right now. :( you won't be able to log in. we're sorry, and are working frantically to fix the problem."),
     heavy_load_msg = _("this page is temporarily in read-only mode due to heavy traffic."),
-    gold_benefits_msg = _("[reddit gold](/gold/about) is reddit's premium membership program. Gold members get extra features like new comment highlighting, notifications when your username is mentioned, \"Friends with benefits\", and more comments per page. You also get special benefits from gold partners for exceptional products and services.\n\nBe sure to check out the new options in the golden box at the bottom of [your preferences](/prefs) and take a look at [the about gold page](/gold/about) to see what else is available."),
+    gold_benefits_msg = _("reddit gold is reddit's premium membership program. Here are the benefits:\n\n* [Extra site features](/gold/about)\n* [Extra perks](/gold/partners)\n* Discuss and get help on the features and perks at /r/goldbenefits"),
     lounge_msg = _("Grab a drink and join us in /r/lounge, the super-secret members-only community that may or may not exist."),
     postcard_msg = _("You sent us a postcard! (Or something similar.) When we run out of room on our refrigerator, we might one day auction off the stuff that people sent in. Is it okay if we include your thing?"),
     over_comment_limit = _("Sorry, the maximum number of comments is %(max)d. (However, if you subscribe to reddit gold, it goes up to %(goldmax)d.)"),
     over_comment_limit_gold = _("Sorry, the maximum number of comments is %d."),
     youve_got_gold = _("%(sender)s just gifted you %(amount)s of reddit gold!"),
     giftgold_note = _("Here's a note that was included:\n\n----\n\n"),
-    youve_got_comment_gold = _("Another user liked [your comment](%(url)s) so much that they gilded it, giving you reddit gold.\n\nEvery day over one million comments are posted to reddit, but only a chosen few are gilded to preserve them for the ages."),
-    gold_summary_autorenew = _("You're about to set up an ongoing, autorenewing subscription to reddit gold for yourself (%(user)s)."),
-    gold_summary_onetime = _("You're about to make a one-time purchase of %(amount)s of reddit gold for yourself (%(user)s)."),
-    gold_summary_creddits = _("You're about to purchase %(amount)s of reddit gold creddits. They work like gift certificates: each creddit you have will allow you to give one month of reddit gold to someone else."),
-    gold_summary_signed_gift = _("You're about to give %(amount)s of reddit gold to %(recipient)s, who will be told that it came from you."),
-    gold_summary_anonymous_gift = _("You're about to give %(amount)s of reddit gold to %(recipient)s. It will be an anonymous gift."),
-    gold_summary_comment_gift = _("Want to say thanks to *%(recipient)s* for this comment? Give them a month of [reddit gold](/gold/about)."),
-    gold_summary_comment_page = _("Give *%(recipient)s* a month of [reddit gold](/gold/about) for this comment:"),
-    gold_partners_description = _('reddit gold members get access to exclusive stuff'),
+    youve_been_gilded_comment = _("Another user liked [your comment](%(url)s) so much that they gilded it, giving you reddit gold.\n\n"),
+    youve_been_gilded_link = _("Another user liked [your submission](%(url)s) so much that they gilded it, giving you reddit gold.\n\n"),
+    gold_summary_autorenew = _("You're about to set up an ongoing, autorenewing subscription to reddit gold for yourself (%(user)s). You'll pay %(price)s for this, %(period)s."),
+    gold_summary_onetime = _("You're about to make a one-time purchase of %(amount)s of reddit gold for yourself (%(user)s). You'll pay a total of %(price)s for this."),
+    gold_summary_creddits = _("You're about to purchase %(amount)s. They work like gift certificates: each creddit you have will allow you to give one month of reddit gold to someone else. You'll pay a total of %(price)s for this."),
+    gold_summary_gift_code = _("You're about to purchase %(amount)s of reddit gold in the form of a gift code. The recipient (or you) will be able to claim the code to redeem that gold to their account. You'll pay a total of %(price)s for this."),
+    gold_summary_signed_gift = _("You're about to give %(amount)s of reddit gold to %(recipient)s, who will be told that it came from you. You'll pay a total of %(price)s for this."),
+    gold_summary_anonymous_gift = _("You're about to give %(amount)s of reddit gold to %(recipient)s. It will be an anonymous gift. You'll pay a total of %(price)s for this."),
+    gold_summary_gilding_comment = _("Want to say thanks to *%(recipient)s* for this comment? Give them a month of [reddit gold](/gold/about)."),
+    gold_summary_gilding_link = _("Want to say thanks to *%(recipient)s* for this submission? Give them a month of [reddit gold](/gold/about)."),
+    gold_summary_gilding_page_comment = _("You're about to give *%(recipient)s* a month of [reddit gold](/gold/about) for this comment:"),
+    gold_summary_gilding_page_link = _("You're about to give *%(recipient)s* a month of [reddit gold](/gold/about) for this submission:"),
+    gold_summary_gilding_page_footer = _("You'll pay a total of %(price)s for this."),
     unvotable_message = _("sorry, this has been archived and can no longer be voted on"),
     account_activity_blurb = _("This page shows a history of recent activity on your account. If you notice unusual activity, you should change your password immediately. Location information is guessed from your computer's IP address and may be wildly wrong, especially for visits from mobile devices. Note: due to a bug, private-use addresses (starting with 10.) sometimes show up erroneously in this list after regular use of the site."),
     your_current_ip_is = _("You are currently accessing reddit from this IP address: %(address)s."),
@@ -178,7 +175,7 @@ Note: there are a couple of places outside of your subreddit where someone can c
     subscribed_multi = _("multireddit of your subscriptions"),
     mod_multi = _("multireddit of subreddits you moderate"),
 
-    r_all_description = _("/r/all displays content from all of reddit, including subreddits you aren't subscribed to."),
+    r_all_description = _("/r/all displays content from all of reddit, including subreddits you aren't subscribed to. Some subreddits have chosen to exclude themselves from /r/all."),
     r_all_minus_description = _("Displaying content from /r/all of reddit, except the following subreddits:"),
     all_minus_gold_only = _('Filtering /r/all is a feature only available to [reddit gold](/gold/about) subscribers. Displaying unfiltered results from /r/all.'),
 )

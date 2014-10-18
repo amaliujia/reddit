@@ -186,11 +186,20 @@ function change_state(elem, op, callback, keep, post_callback) {
     return false;
 };
 
+function alterUnreadCount(num) {
+  var msgCount = $('.message-count');
+  if (msgCount.length > 0) {
+    msgCount.text(parseInt(msgCount.text(), 10) + num);
+  }
+}
+
 function unread_thing(elem) {
     var t = $(elem);
     if (!t.hasClass("thing")) {
         t = t.thing();
     }
+
+    alterUnreadCount(1);
     $(t).addClass("new unread");
 }
 
@@ -204,6 +213,8 @@ function read_thing(elem) {
     } else {
         $(t).removeClass("unread");
     }
+
+    alterUnreadCount(-1);
     $.request("read_message", {"id": $(t).thing_id()});
 }
 
@@ -213,20 +224,6 @@ function save_thing(elem) {
 
 function unsave_thing(elem) {
     $(elem).thing().removeClass("saved");
-}
-
-function toggle_save(elem) {
-    var form = $(elem).parents("form").first()
-    var next_text = form.find('[name="executed"]')
-    var text = next_text.val()
-    if ($(elem).thing().hasClass("saved")) {
-        change_state(elem, 'unsave', undefined, true)
-    } else {
-        change_state(elem, 'save', undefined, true)
-    }
-    $(elem).thing().toggleClass("saved")
-    next_text.val($(elem).text())
-    $(elem).text(text)
 }
 
 function click_thing(elem) {
@@ -261,12 +258,12 @@ function toggle_label (elem, callback, cancelback) {
 function toggle(elem, callback, cancelback) {
     r.analytics.breadcrumbs.storeLastClick(elem)
 
-    var self = $(elem).parent().andSelf().filter(".option");
+    var self = $(elem).parent().addBack().filter(".option");
     var sibling = self.removeClass("active")
         .siblings().addClass("active").get(0); 
 
     /*
-    var self = $(elem).siblings().andSelf();
+    var self = $(elem).siblings().addBack();
     var sibling = self.filter(":hidden").debug();
     self = self.filter(":visible").removeClass("active");
     sibling = sibling.addClass("active").get(0);
@@ -313,7 +310,7 @@ function subscribe(reddit_name) {
             }
             $.things(reddit_name).find(".entry").addClass("likes");
             $.request("subscribe", {sr: reddit_name, action: "sub"});
-            r.analytics.fireUITrackingPixel("sub", reddit_name)
+            r.analytics.fireUITrackingPixel("sub", reddit_name, {"has_subd": r.config.has_subscribed})
         }
     };
 };
@@ -349,15 +346,21 @@ function unfriend(user_name, container_name, type) {
 };
 
 function share(elem) {
-    $.request("new_captcha");
-    $(elem).new_thing_child($(".sharelink:first").clone(true)
-                            .attr("id", "sharelink_" + $(elem).thing_id()),
-                             false);
-    $.request("new_captcha");
+  var thingId = $(elem).thing_id();
+  r.analytics.fireGAEvent('share', 'shareOpen', thingId);
+
+  $.request("new_captcha");
+  $(elem).new_thing_child($(".sharelink:first").clone(true)
+                          .attr("id", "sharelink_" + thingId),
+                           false);
+  $.request("new_captcha");
 };
 
 function cancelShare(elem) {
-    return cancelToggleForm(elem, ".sharelink", ".share-button");
+  var thingId = $(elem).thing_id();
+  r.analytics.fireGAEvent('share', 'shareClose', thingId);
+
+  return cancelToggleForm(elem, ".sharelink", ".share-button");
 };
 
 function reject_promo(elem) {
@@ -382,70 +385,86 @@ function helpoff(elem) {
 };
 
 function show_all_messages(elem) {
-    var m = $(elem).parents(".message");
+    var $rootMessage = $(elem).parents(".message");
+    var $childMessages = $rootMessage.find(".message");
+    var $messages = $rootMessage.add($childMessages);
     var ids = [];
-    m.find(".entry .collapsed").hide().end()
-        .find(".noncollapsed, .midcol:first").filter(":hidden")
-        .each(function() { 
-                var t = $(this).show().thing_id(); 
-                if(ids.indexOf(t) == -1) {
-                    ids.push(t);
-                }
-            });
-    if(ids.length) {
+
+    _.each($messages, function(message) {
+      var $message = $(message);
+      var $expander = $message.find(".expand:first");
+      var isCollapsed = $message.hasClass("collapsed");
+
+      if (isCollapsed) {
+        $message.toggleClass("collapsed noncollapsed");
+        $expander.text("[-]");
+        ids.push($message.thing_id());
+      }
+    });
+
+    if (ids.length) {
         $.request("uncollapse_message", {"id": ids.join(',')});
     }
-    return false; 
+    return false;
 }
 
 function hide_all_messages(elem) {
-    var m = $(elem).parents(".message");
+    var $rootMessage = $(elem).parents(".message");
+    var $childMessages = $rootMessage.find(".message");
+    var $messages = $rootMessage.add($childMessages);
     var ids = [];
-    m.find(".entry .collapsed").show().end()
-        .find(".noncollapsed, .midcol:first").filter(":visible")
-        .each(function() { 
-                var t = $(this).hide().thing_id(); 
-                if(ids.indexOf(t) == -1) {
-                    ids.push(t);
-                }
-            });
-    if(ids.length) {
+
+    _.each($messages, function(message) {
+      var $message = $(message);
+      var $expander = $message.find(".expand:first");
+      var isCollapsed = $message.hasClass("collapsed");
+
+      if (!isCollapsed) {
+        $message.toggleClass("collapsed noncollapsed");
+        $expander.text("[+]");
+        ids.push($message.thing_id());
+      }
+    });
+
+    if (ids.length) {
         $.request("collapse_message", {"id": ids.join(',')});
     }
-    return false; 
+    return false;
 }
 
-function hidecomment(elem) {
-    var t = $(elem).thing();
-    t.hide()
-        .find(".noncollapsed:first, .midcol:first").hide().end()
-        .show().find(".entry:first .collapsed").show();
-    if(t.hasClass("message")) {
-        $.request("collapse_message", {"id": $(t).thing_id()});
-    } else {
-        t.find(".child:first").hide();
-    }
-    return false;
-};
+function togglecomment(elem) {
+  var comment = $(elem).thing()
+  var expander = comment.find(".expand:first")
+  var isCollapsed = comment.hasClass("collapsed")
+  comment.toggleClass("collapsed noncollapsed")
 
-function showcomment(elem) {
-    var t = $(elem).thing();
-    t.find(".entry:first .collapsed").hide().end()
-        .find(".noncollapsed:first, .midcol:first").show().end()
-        .show();
-    if(t.hasClass("message")) {
-        $.request("uncollapse_message", {"id": $(t).thing_id()});
-    } else {
-        t.find(".child:first").show();
-    }
-    return false;
-};
+  if (!isCollapsed) {
+    expander.text("[+]")
+  } else {
+    expander.text("[–]")
+  }
+}
 
-function morechildren(form, link_id, children, depth, pv_hex) {
+function togglemessage(elem) {
+  var message = $(elem).thing()
+  var expander = message.find(".expand:first")
+  var isCollapsed = message.hasClass("collapsed")
+  message.toggleClass("collapsed noncollapsed")
+
+  if (!isCollapsed) {
+    expander.text("[+]")
+    $.request("collapse_message", { "id": $(message).thing_id() })
+  } else {
+    expander.text("[–]")
+    $.request("uncollapse_message", { "id": $(message).thing_id() })
+  }
+}
+
+function morechildren(form, link_id, sort, children, depth, pv_hex) {
     $(form).html(reddit.status_msg.loading)
         .css("color", "red");
     var id = $(form).parents(".thing.morechildren:first").thing_id();
-    $.request('morechildren', {link_id: link_id,
+    $.request('morechildren', {link_id: link_id, sort: sort,
               children: children, depth: depth, id: id, pv_hex: pv_hex});
     return false;
 };
@@ -522,8 +541,6 @@ function updateEventHandlers(thing) {
     /* click on a title.. */
     $(thing).filter(".link")
         .find("a.title, a.comments").mousedown(function() {
-            /* mark as clicked */
-            $(this).addClass("click");
             /* set the click cookie. */
             add_thing_to_cookie(this, "recentclicks2");
         });
@@ -561,15 +578,10 @@ function last_click() {
 }
 
 function login(elem) {
-    if(cnameframe)
-        return true;
-
     return post_user(this, "login");
 };
 
 function register(elem) {
-    if(cnameframe)
-        return true;
     return post_user(this, "register");
 };
 
@@ -864,19 +876,19 @@ function comment_reply_for_elem(elem) {
 
 function edit_usertext(elem) {
     var t = $(elem).thing();
-    t.find(".edit-usertext:first").parent("li").andSelf().hide();
+    t.find(".edit-usertext:first").parent("li").addBack().hide();
     show_edit_usertext(t.find(".usertext:first"));
 }
 
 function cancel_usertext(elem) {
     var t = $(elem);
-    t.thing().find(".edit-usertext:first").parent("li").andSelf().show(); 
+    t.thing().find(".edit-usertext:first").parent("li").addBack().show(); 
     hide_edit_usertext(t.closest(".usertext"));
 }
 
 function save_usertext(elem) {
     var t = $(elem).thing();
-    t.find(".edit-usertext:first").parent("li").andSelf().show(); 
+    t.find(".edit-usertext:first").parent("li").addBack().show(); 
 }
 
 function reply(elem) {
@@ -973,11 +985,11 @@ var toolbar_p = function(expanded_size, collapsed_size) {
     };
     
     this.show_panel = function() {
-        parent.inner_toolbar.document.body.cols = expanded_size;
+        $('body', parent.inner_toolbar.document).addClass('expanded')
     };
         
     this.hide_panel = function() {
-        parent.inner_toolbar.document.body.cols = collapsed_size;
+        $('body', parent.inner_toolbar.document).removeClass('expanded')
     };
         
     this.resize_toolbar = function() {
@@ -1057,31 +1069,31 @@ function check_some_langs(elem) {
 }
 
 function fetch_parent(elem, parent_permalink, parent_id) {
-    $(elem).css("color", "red").html(reddit.status_msg.loading);
     var thing = $(elem).thing();
-    var parentdiv = thing.find(".uncollapsed .parent");
-    if (parentdiv.length == 0) {
-        var parent = '';
-        $.getJSON(parent_permalink, function(response) {
-                $.each(response, function() {
-                        if (this && this.data.children) {
-                            $.each(this.data.children, function() {
-                                    if(this.data.name == parent_id) {
-                                        parent= this.data.body_html; 
-                                    }
-                                });
-                        }
-                    });
-                if(parent) {
-                    /* make a parent div for the contents of the fetch */
-                    thing.find(".noncollapsed .md").first() 
-                        .before('<div class="parent rounded">' +
-                                $.unsafe(parent) +
-                                '</div>'); 
-                }
-                $(elem).parent("li").andSelf().remove();
-            });
-    }
+    var parent = '';
+
+    $(elem).css("color", "red").html(reddit.status_msg.loading);
+
+    $.getJSON(parent_permalink, function(response) {
+      $.each(response, function() {
+        if (this && this.data.children) {
+          $.each(this.data.children, function() {
+            if (this.data.name == parent_id) {
+              parent = this.data.body_html;
+            }
+          });
+        }
+      });
+
+      if (parent) {
+        /* make a parent div for the contents of the fetch */
+        thing.find(".md").first()
+          .before('<div class="parent rounded">' + $.unsafe(parent) + '</div>');
+      }
+
+      /* remove the button */
+      $(elem).parent("li").addBack().remove();
+    });
     return false;
 }
 
@@ -1158,6 +1170,9 @@ $(function() {
         }
         /* set up the cookie domain */
         $.default_cookie_domain(reddit.cur_domain.split(':')[0]);
+
+        // When forcing HTTPS, all cookies need the secure flag
+        $.default_cookie_security(reddit.https_forced)
         
         /* visually mark the last-clicked entry */
         last_click();
@@ -1228,17 +1243,6 @@ function show_unfriend(account_fullname) {
                 $(this).html("");
             }
         });
-}
-
-function show_saved(comment_fullname) {
-    var comment = $('.id-' + comment_fullname),
-        buttons = comment.find('.buttons').first(),
-        save = buttons.find('.comment-save-button')
-        form = '<li class="comment-unsave-button"><form action="/post/unsave" method="post" class="state-button unsave-button">'
-    form = form + '<input type="hidden" name="executed" value="unsaved"/><span>'
-    form = form + '<a href="javascript:void(0)" onclick="return change_state(this, \'unsave\', unsave_thing);">unsave</a></span></form></li>'
-    save.replaceWith(form)
-    comment.addClass('saved')
 }
 
 function search_feedback(elem, approval) {

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -25,7 +25,9 @@ import base64
 import traceback
 import ConfigParser
 import codecs
+import itertools
 
+from babel.dates import TIMEDELTA_UNITS
 from urllib import unquote_plus
 from urllib2 import urlopen, Request
 from urlparse import urlparse, urlunparse
@@ -38,30 +40,23 @@ from decimal import Decimal
 
 from BeautifulSoup import BeautifulSoup, SoupStrainer
 
-from time import sleep
 from datetime import date, datetime, timedelta
 from pylons import c, g
 from pylons.i18n import ungettext, _
 from r2.lib.filters import _force_unicode, _force_utf8
 from mako.filters import url_escape
 from r2.lib.contrib import ipaddress
-from r2.lib.require import require, require_split
+from r2.lib.require import require, require_split, RequirementException
 import snudown
 
 from r2.lib.utils._utils import *
 
 iters = (list, tuple, set)
 
-def randstr(len, reallyrandom = False):
-    """If reallyrandom = False, generates a random alphanumeric string
-    (base-36 compatible) of length len.  If reallyrandom, add
-    uppercase and punctuation (which we'll call 'base-93' for the sake
-    of argument) and suitable for use as salt."""
-    alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
-    if reallyrandom:
-        alphabet += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ!#$%&\()*+,-./:;<=>?@[\\]^_{|}~'
-    return ''.join(random.choice(alphabet)
-                   for i in range(len))
+def randstr(length,
+            alphabet='abcdefghijklmnopqrstuvwxyz0123456789'):
+    """Return a string made up of random chars from alphabet."""
+    return ''.join(random.choice(alphabet) for _ in xrange(length))
 
 class Storage(dict):
     """
@@ -103,68 +98,6 @@ class Storage(dict):
 
 storage = Storage
 
-def storify(mapping, *requireds, **defaults):
-    """
-    Creates a `storage` object from dictionary `mapping`, raising `KeyError` if
-    d doesn't have all of the keys in `requireds` and using the default
-    values for keys found in `defaults`.
-
-    For example, `storify({'a':1, 'c':3}, b=2, c=0)` will return the equivalent of
-    `storage({'a':1, 'b':2, 'c':3})`.
-
-    If a `storify` value is a list (e.g. multiple values in a form submission),
-    `storify` returns the last element of the list, unless the key appears in
-    `defaults` as a list. Thus:
-
-        >>> storify({'a':[1, 2]}).a
-        2
-        >>> storify({'a':[1, 2]}, a=[]).a
-        [1, 2]
-        >>> storify({'a':1}, a=[]).a
-        [1]
-        >>> storify({}, a=[]).a
-        []
-
-    Similarly, if the value has a `value` attribute, `storify will return _its_
-    value, unless the key appears in `defaults` as a dictionary.
-
-        >>> storify({'a':storage(value=1)}).a
-        1
-        >>> storify({'a':storage(value=1)}, a={}).a
-        <Storage {'value': 1}>
-        >>> storify({}, a={}).a
-        {}
-
-    """
-    def getvalue(x):
-        if hasattr(x, 'value'):
-            return x.value
-        else:
-            return x
-
-    stor = Storage()
-    for key in requireds + tuple(mapping.keys()):
-        value = mapping[key]
-        if isinstance(value, list):
-            if isinstance(defaults.get(key), list):
-                value = [getvalue(x) for x in value]
-            else:
-                value = value[-1]
-        if not isinstance(defaults.get(key), dict):
-            value = getvalue(value)
-        if isinstance(defaults.get(key), list) and not isinstance(value, list):
-            value = [value]
-        setattr(stor, key, value)
-
-    for (key, value) in defaults.iteritems():
-        result = value
-        if hasattr(stor, key):
-            result = stor[key]
-        if value == () and not isinstance(result, tuple):
-            result = (result,)
-        setattr(stor, key, result)
-
-    return stor
 
 class Enum(Storage):
     def __init__(self, *a):
@@ -249,8 +182,7 @@ def path_component(s):
     return (res and res[0]) or s
 
 def get_title(url):
-    """Fetches the contents of url and extracts (and utf-8 encodes)
-       the contents of <title>"""
+    """Fetch the contents of url and try to extract the page's title."""
     if not url or not url.startswith(('http://', 'https://')):
         return None
 
@@ -285,39 +217,53 @@ def get_title(url):
         return None
 
 def extract_title(data):
-    """Tries to extract the value of the title element from a string of HTML"""
+    """Try to extract the page title from a string of HTML.
+
+    An og:title meta tag is preferred, but will fall back to using
+    the <title> tag instead if one is not found. If using <title>,
+    also attempts to trim off the site's name from the end.
+    """
     bs = BeautifulSoup(data, convertEntities=BeautifulSoup.HTML_ENTITIES)
-    if not bs:
+    if not bs or not bs.html.head:
         return
+    head_soup = bs.html.head
 
-    title_bs = bs.html.head.title
+    title = None
 
-    if not title_bs or not title_bs.string:
+    # try to find an og:title meta tag to use
+    og_title = (head_soup.find("meta", attrs={"property": "og:title"}) or
+                head_soup.find("meta", attrs={"name": "og:title"}))
+    if og_title:
+        title = og_title.get("content")
+
+    # if that failed, look for a <title> tag to use instead
+    if not title and head_soup.title and head_soup.title.string:
+        title = head_soup.title.string
+
+        # remove end part that's likely to be the site's name
+        # looks for last delimiter char between spaces in strings
+        # delimiters: |, -, emdash, endash,
+        #             left- and right-pointing double angle quotation marks
+        reverse_title = title[::-1]
+        to_trim = re.search(u'\s[\u00ab\u00bb\u2013\u2014|-]\s',
+                            reverse_title,
+                            flags=re.UNICODE)
+
+        # only trim if it won't take off over half the title
+        if to_trim and to_trim.end() < len(title) / 2:
+            title = title[:-(to_trim.end())]
+
+    if not title:
         return
-
-    title = title_bs.string
-
-    # remove end part that's likely to be the site's name
-    # looks for last delimiter char between spaces in strings
-    # delimiters: |, -, emdash, endash,
-    #             left- and right-pointing double angle quotation marks
-    reverse_title = title[::-1]
-    to_trim = re.search(u'\s[\u00ab\u00bb\u2013\u2014|-]\s',
-                        reverse_title,
-                        flags=re.UNICODE)
-
-    # only trim if it won't take off over half the title
-    if to_trim and to_trim.end() < len(title) / 2:
-        title = title[:-(to_trim.end())]
 
     # get rid of extraneous whitespace in the title
     title = re.sub(r'\s+', ' ', title, flags=re.UNICODE)
 
     return title.encode('utf-8').strip()
 
-valid_schemes = ('http', 'https', 'ftp', 'mailto')
+VALID_SCHEMES = ('http', 'https', 'ftp', 'mailto')
 valid_dns = re.compile('\A[-a-zA-Z0-9]+\Z')
-def sanitize_url(url, require_scheme = False):
+def sanitize_url(url, require_scheme=False, valid_schemes=VALID_SCHEMES):
     """Validates that the url is of the form
 
     scheme://domain/path/to/content#anchor?cruft
@@ -328,7 +274,7 @@ def sanitize_url(url, require_scheme = False):
     otherwise validates"""
 
     if not url:
-        return
+        return None
 
     url = url.strip()
     if url.lower() == 'self':
@@ -341,33 +287,48 @@ def sanitize_url(url, require_scheme = False):
             url = 'http://' + url
             u = urlparse(url)
     except ValueError:
-        return
+        return None
 
-    if u.scheme and u.scheme in valid_schemes:
-        # if there is a scheme and no hostname, it is a bad url.
-        if not u.hostname:
-            return
-        if u.username is not None or u.password is not None:
-            return
-        labels = u.hostname.split('.')
-        for label in labels:
-            try:
-                #if this succeeds, this portion of the dns is almost
-                #valid and converted to ascii
-                label = label.encode('idna')
-            except TypeError:
-                print "label sucks: [%r]" % label
-                raise
-            except UnicodeError:
-                return
-            else:
-                #then if this success, this portion of the dns is really valid
-                if not re.match(valid_dns, label):
-                    return
-        return url
+    if not u.scheme:
+        return None
+    if valid_schemes is not None and u.scheme not in valid_schemes:
+        return None
 
-def trunc_string(text, length):
-    return text[0:length]+'...' if len(text)>length else text
+    # if there is a scheme and no hostname, it is a bad url.
+    if not u.hostname:
+        return None
+    if u.username is not None or u.password is not None:
+        return None
+
+    try:
+        idna_hostname = u.hostname.encode('idna')
+    except TypeError as e:
+        g.log.warning("Bad hostname given [%r]: %s", u.hostname, e)
+        raise
+    except UnicodeError:
+        return None
+
+    for label in idna_hostname.split('.'):
+        if not re.match(valid_dns, label):
+            return None
+
+    if idna_hostname != u.hostname:
+        url = urlunparse((u[0], idna_hostname, u[2], u[3], u[4], u[5]))
+    return url
+
+def trunc_string(text, max_length, suffix='...'):
+    """Truncate a string, attempting to split on a word-break.
+
+    If the first word is longer than max_length, then truncate within the word.
+
+    Adapted from http://stackoverflow.com/a/250406/120999 .
+    """
+    if len(text) <= max_length:
+        return text
+    else:
+        hard_truncated = text[:(max_length - len(suffix))]
+        word_truncated = hard_truncated.rsplit(' ', 1)[0]
+        return word_truncated + suffix
 
 # Truncate a time to a certain number of minutes
 # e.g, trunc_time(5:52, 30) == 5:30
@@ -510,7 +471,7 @@ class UrlParser(object):
             q = query_string(q).lstrip('?')
 
         # make sure the port is not doubly specified
-        if self.port and ":" in self.hostname:
+        if getattr(self, 'port', None) and ":" in self.hostname:
             self.hostname = self.hostname.split(':')[0]
 
         # if there is a netloc, there had better be a scheme
@@ -542,7 +503,9 @@ class UrlParser(object):
         from pylons import g
         from r2.models import Subreddit, Sub, NotFound, DefaultSR
         try:
-            if not self.hostname or self.hostname.startswith(g.domain):
+            if (not self.hostname or
+                    is_subdomain(self.hostname, g.domain) or
+                    self.hostname.startswith(g.domain)):
                 if self.path.startswith('/r/'):
                     return Subreddit._by_name(self.path.split('/')[2])
                 elif self.path.startswith(('/subreddits/', '/reddits/')):
@@ -564,10 +527,18 @@ class UrlParser(object):
         g.domain, or a subdomain of the provided subreddit's cname.
         """
         from pylons import g
-        return (not self.hostname or
-                is_subdomain(self.hostname, g.domain) or
-                (subreddit and subreddit.domain and
-                 is_subdomain(self.hostname, subreddit.domain)))
+        subdomain = (
+            not self.hostname or
+            is_subdomain(self.hostname, g.domain) or
+            (subreddit and subreddit.domain and
+                is_subdomain(self.hostname, subreddit.domain))
+        )
+        if not subdomain or not self.hostname or not g.offsite_subdomains:
+            return subdomain
+        return not any(
+            self.hostname.startswith(subdomain + '.')
+            for subdomain in g.offsite_subdomains
+        )
 
     def path_add_subreddit(self, subreddit):
         """
@@ -610,7 +581,7 @@ class UrlParser(object):
 
             # update the domain (preserving the port)
             self.hostname = subreddit.domain
-            self.port = self.port or port
+            self.port = getattr(self, 'port', None) or port
 
             # and remove any cnameframe GET parameters
             if self.query_dict.has_key(self.cname_get):
@@ -676,6 +647,18 @@ class UrlParser(object):
 
         return urlunparse((u.scheme.lower(), netloc,
                            u.path, u.params, u.query, fragment))
+
+
+def url_is_embeddable_image(url):
+    """The url is on an oembed-friendly domain and looks like an image."""
+    parsed_url = UrlParser(url)
+
+    if parsed_url.path_extension().lower() in {"jpg", "gif", "png", "jpeg"}:
+        if parsed_url.hostname not in g.known_image_domains:
+            return False
+        return True
+
+    return False
 
 
 def pload(fname, default = None):
@@ -907,18 +890,6 @@ def UniqueIterator(iterator, key = lambda x: x):
 
     return IteratorFilter(iterator, no_dups)
 
-def modhash(user, rand = None, test = False):
-    return user.name
-
-def valid_hash(user, hash):
-    return True
-
-def check_cheating(loc):
-    pass
-
-def vote_hash():
-    return ''
-
 def safe_eval_str(unsafe_str):
     return unsafe_str.replace('\\x3d', '=').replace('\\x26', '&')
 
@@ -972,76 +943,29 @@ def common_subdomain(domain1, domain2):
                 return d
     return ""
 
-def interleave_lists(*args):
-    max_len = max(len(x) for x in args)
-    for i in xrange(max_len):
-        for a in args:
-            if i < len(a):
-                yield a[i]
-
-def link_from_url(path, filter_spam = False, multiple = True):
-    from pylons import c
-    from r2.models import IDBuilder, Link, Subreddit, NotFound
-
-    if not path:
-        return
-
-    try:
-        links = Link._by_url(path, c.site)
-    except NotFound:
-        return [] if multiple else None
-
-    return filter_links(tup(links), filter_spam = filter_spam,
-                        multiple = multiple)
-
-def filter_links(links, filter_spam = False, multiple = True):
-    # run the list through a builder to remove any that the user
-    # isn't allowed to see
-    from pylons import c
-    from r2.models import IDBuilder, Link, Subreddit, NotFound
-    links = IDBuilder([link._fullname for link in links],
-                      skip = False).get_items()[0]
-    if not links:
-        return
-
-    if filter_spam:
-        # first, try to remove any spam
-        links_nonspam = [ link for link in links
-                          if not link._spam ]
-        if links_nonspam:
-            links = links_nonspam
-
-    # if it occurs in one or more of their subscriptions, show them
-    # that one first
-    subs = set(Subreddit.user_subreddits(c.user, limit = None))
-    def cmp_links(a, b):
-        if a.sr_id in subs and b.sr_id not in subs:
-            return -1
-        elif a.sr_id not in subs and b.sr_id in subs:
-            return 1
-        else:
-            return cmp(b._hot, a._hot)
-    links = sorted(links, cmp = cmp_links)
-
-    # among those, show them the hottest one
-    return links if multiple else links[0]
 
 def url_links_builder(url, exclude=None, num=None, after=None, reverse=None,
-                      count=None):
+                      count=None, public_srs_only=False):
     from r2.lib.template_helpers import add_sr
-    from r2.models import IDBuilder, Link, NotFound
+    from r2.models import IDBuilder, Link, NotFound, Subreddit
     from operator import attrgetter
 
     if url.startswith('/'):
         url = add_sr(url, force_hostname=True)
 
     try:
-        links = tup(Link._by_url(url, None))
+        links = Link._by_url(url, None)
     except NotFound:
         links = []
 
     links = [ link for link in links
                    if link._fullname != exclude ]
+
+    if public_srs_only and not c.user_is_admin:
+        subreddits = Subreddit._byID([link.sr_id for link in links], data=True)
+        links = [link for link in links
+                 if subreddits[link.sr_id].type != "private"]
+
     links.sort(key=attrgetter('num_comments'), reverse=True)
 
     # don't show removed links in duplicates unless admin or mod
@@ -1072,12 +996,12 @@ class TimeoutFunction:
     def handle_timeout(self, signum, frame):
         raise TimeoutFunctionException()
 
-    def __call__(self, *args):
+    def __call__(self, *args, **kwargs):
         # can only be called from the main thread
         old = signal.signal(signal.SIGALRM, self.handle_timeout)
         signal.alarm(self.timeout)
         try:
-            result = self.function(*args)
+            result = self.function(*args, **kwargs)
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old)
@@ -1116,7 +1040,7 @@ def to_date(d):
     return d
 
 def to_datetime(d):
-    if isinstance(d, date):
+    if type(d) == date:
         return datetime(d.year, d.month, d.day)
     return d
 
@@ -1133,53 +1057,6 @@ def in_chunks(it, size=25):
         if chunk:
             yield chunk
 
-def spaceout(items, targetseconds,
-             minsleep = 0, die = False,
-             estimate = None):
-    """Given a list of items and a function to apply to them, space
-       the execution out over the target number of seconds and
-       optionally stop when we're out of time"""
-    targetseconds = float(targetseconds)
-    state = [1.0]
-
-    if estimate is None:
-        try:
-            estimate = len(items)
-        except TypeError:
-            # if we can't come up with an estimate, the best we can do
-            # is just enforce the minimum sleep time (and the max
-            # targetseconds if die==True)
-            pass
-
-    mean = lambda lst: sum(float(x) for x in lst)/float(len(lst))
-    beginning = datetime.now()
-
-    for item in items:
-        start = datetime.now()
-        yield item
-        end = datetime.now()
-
-        took_delta = end - start
-        took = (took_delta.days * 60 * 24
-                + took_delta.seconds
-                + took_delta.microseconds/1000000.0)
-        state.append(took)
-        if len(state) > 10:
-            del state[0]
-
-        if die and end > beginning + timedelta(seconds=targetseconds):
-            # we ran out of time, ignore the rest of the iterator
-            break
-
-        if estimate is None:
-            if minsleep:
-                # we have no idea how many items we're going to get
-                sleep(minsleep)
-        else:
-            sleeptime = max((targetseconds / estimate) - mean(state),
-                            minsleep)
-            if sleeptime > 0:
-                sleep(sleeptime)
 
 def progress(it, verbosity=100, key=repr, estimate=None, persec=True):
     """An iterator that yields everything from `it', but prints progress
@@ -1406,6 +1283,27 @@ def extract_urls_from_markdown(md):
             yield url
 
 
+def extract_user_mentions(text, num=None):
+    from r2.lib.validator import chkuser
+    if num is None:
+        num = g.butler_max_mentions
+
+    cur_num = 0
+    for url in extract_urls_from_markdown(text):
+        if num != -1 and cur_num >= num:
+            break
+
+        if not url.startswith("/u/"):
+            continue
+
+        username = url[len("/u/"):]
+        if not chkuser(username):
+            continue
+
+        cur_num += 1
+        yield username.lower()
+
+
 def summarize_markdown(md):
     """Get the first paragraph of some Markdown text, potentially truncated."""
 
@@ -1487,9 +1385,8 @@ def weighted_lottery(weights, _random=random.random):
 
 
 def read_static_file_config(config_file):
-    parser = ConfigParser.RawConfigParser()
-    with open(config_file, "r") as cf:
-        parser.readfp(cf)
+    with open(config_file) as f:
+        parser = parse_ini_file(f)
     config = dict(parser.items("static_files"))
 
     s3 = boto.connect_s3(config["aws_access_key_id"],
@@ -1552,3 +1449,63 @@ def canonicalize_email(email):
     localpart = localpart.partition("+")[0]
 
     return localpart + "@" + domain
+
+
+def precise_format_timedelta(delta, locale, threshold=.85, decimals=2):
+    """Like babel.dates.format_datetime but with adjustable precision"""
+    seconds = delta.total_seconds()
+
+    for unit, secs_per_unit in TIMEDELTA_UNITS:
+        value = abs(seconds) / secs_per_unit
+        if value >= threshold:
+            plural_form = locale.plural_form(value)
+            pattern = None
+            for choice in (unit + ':medium', unit):
+                patterns = locale._data['unit_patterns'].get(choice)
+                if patterns is not None:
+                    pattern = patterns[plural_form]
+                    break
+            if pattern is None:
+                return u''
+            decimals = int(decimals)
+            format_string = "%." + str(decimals) + "f"
+            return pattern.replace('{0}', format_string % value)
+    return u''
+
+
+def parse_ini_file(config_file):
+    """Given an open file, read and parse it like an ini file."""
+
+    parser = ConfigParser.RawConfigParser()
+    parser.optionxform = str  # ensure keys are case-sensitive as expected
+    parser.readfp(config_file)
+    return parser
+
+def fuzz_activity(count):
+    """Add some jitter to an activity metric to maintain privacy."""
+    # decay constant is e**(-x / 60)
+    decay = math.exp(float(-count) / 60)
+    jitter = round(5 * decay)
+    return count + random.randint(0, jitter)
+
+
+# port of https://docs.python.org/dev/library/itertools.html#itertools-recipes
+def partition(pred, iterable):
+    "Use a predicate to partition entries into false entries and true entries"
+    # partition(is_odd, range(10)) --> 0 2 4 6 8   and  1 3 5 7 9
+    t1, t2 = itertools.tee(iterable)
+    return itertools.ifilterfalse(pred, t1), itertools.ifilter(pred, t2)
+
+# http://docs.python.org/2/library/itertools.html#recipes
+def roundrobin(*iterables):
+    "roundrobin('ABC', 'D', 'EF') --> A D E B F C"
+    # Recipe credited to George Sakkis
+    pending = len(iterables)
+    nexts = itertools.cycle(iter(it).next for it in iterables)
+    while pending:
+        try:
+            for next in nexts:
+                yield next()
+        except StopIteration:
+            pending -= 1
+            nexts = itertools.cycle(itertools.islice(nexts, pending))

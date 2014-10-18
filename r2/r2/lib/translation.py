@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -40,6 +40,10 @@ except ImportError:
     I18N_PATH = ''
 else:
     I18N_PATH = os.path.dirname(reddit_i18n.__file__)
+
+# Different from the default lang (as defined in the ini file)
+# Source language is what is in the source code
+SOURCE_LANG = 'en'
 
 
 def _get_translator(lang, graceful_fail=False, **kwargs):
@@ -91,7 +95,9 @@ def load_data(lang_path, domain=None, extension='data'):
 
 def iter_langs(base_path=I18N_PATH):
     if base_path:
-        for lang in os.listdir(base_path):
+        # sorted() so that get_active_langs can check completion
+        # data on "base" languages of a dialect
+        for lang in sorted(os.listdir(base_path)):
             full_path = os.path.join(base_path, lang, 'LC_MESSAGES')
             if os.path.isdir(full_path):
                 yield lang, full_path
@@ -100,12 +106,23 @@ def iter_langs(base_path=I18N_PATH):
 def get_active_langs(path=I18N_PATH, default_lang='en'):
     trans = []
     trans_name = {}
+    completions = {}
     for lang, lang_path in iter_langs(path):
         data = load_data(lang_path)
         name = [data['name'], '']
         if data['_is_enabled'] and lang != default_lang:
             trans.append(lang)
             completion = float(data['num_completed']) / float(data['num_total'])
+            completions[lang] = completion
+            # This relies on iter_langs hitting the base_lang first
+            base_lang, is_dialect, dialect = lang.partition("-")
+            if is_dialect:
+                if base_lang == SOURCE_LANG:
+                    # Source language has to be 100% complete
+                    base_completion = 1.0
+                else:
+                    base_completion = completions.get(base_lang, 0)
+                completion = max(completion, base_completion)
             if completion < .5:
                 name[1] = ' (*)'
         trans_name[lang] = name
@@ -122,27 +139,6 @@ def get_catalog(lang):
     path = os.path.join(I18N_PATH, lang, "LC_MESSAGES", "r2.po")
     with open(path, "r") as f:
         return babel.messages.pofile.read_po(f)
-
-
-class extract_messages(babel.messages.frontend.extract_messages):
-    """Extract messages from all specified directories.
-
-    This is a work around for a bug in Babel which causes the --input-dirs
-    parameter to extract_messages to not work properly.
-
-    The bug has been fixed in babel, but no releases have been made since the
-    fix. This class will do the trick until that time and should be safe once
-    the fix is released.
-
-    http://babel.edgewall.org/ticket/232
-
-    """
-
-    def finalize_options(self):
-        if self.input_dirs:
-            self.input_dirs = self.input_dirs.split(",")
-
-        babel.messages.frontend.extract_messages.finalize_options(self)
 
 
 def validate_plural_forms(plural_forms_str):
@@ -170,6 +166,7 @@ def extract_javascript_msgids(source):
             "_": None,
             "P_": (1, 2),
             "N_": None,
+            "NP_": (1, 2),
         },
         comment_tags={},
         options={},

@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -43,37 +43,31 @@
       ${flair(thing, enabled=thing.force_show_flair)}
     %endif
     <%
-      classes = [thing.author_cls, 'id-%s' % thing.fullname]
+      classes = [thing.author_cls, 'may-blank', 'id-%s' % thing.fullname]
       if thing.include_flair_selector:
           classes.append('flairselectable')
     %>
     ${plain_link(thing.name + thing.karma, "/user/%s" % thing.name,
                  _class = ' '.join(classes),
-                 _sr_path = False, target='_blank' if c.user.pref_newwindow else target, title=thing.author_title)}
+                 _sr_path = False, target=target, title=thing.author_title)}
     %if thing.flair_position == 'right':
       ${flair(thing, enabled=thing.force_show_flair)}
     %endif
     %if thing.include_flair_selector:
-      (<a class="flairselectbtn" href="javascript://void(0)">${_('edit')}</a>)
+      (<a class="flairselectbtn" data-name="${thing.name}" href="javascript://void(0)">${_('edit')}</a>)
       <div class="flairselector drop-choices"></div>
-      <form><input type="hidden" name="name" value="${thing.name}"></form>
     %endif
     <span class="userattrs">
     %if thing.attribs:
       [
-      %for priority, abbv, css_class, label, attr_link, img in thing.attribs:
+      %for priority, abbv, css_class, label, attr_link in thing.attribs:
         %if attr_link:
           <a class="${css_class}" title="${label}"
           %if target:
              target="${target}"
           %endif
              href="${attr_link}">
-          %if img:
-            <% (src, alt, width, height) = img %>
-            <img src="${src}" alt="${alt}" width="${width}" height="${height}"/>
-          %else:
             ${unsafe(abbv)}
-          %endif
           </a>
         %else:
           <span class="${css_class}" title="${label}">${abbv}</span>

@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2013
+## All portions of the code written by reddit are Copyright (c) 2006-2014
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -48,7 +48,7 @@
   <%
     op = "reg" if register else "login"
     base = g.https_endpoint if not c.cname else ''
-    tabindex = 3 if register else 2
+    tabindex = 2 if register else 3
   %>
   <form id="login_${op}" method="post" 
         action="${add_sr(base + '/post/' + op, nocname=not c.authorized_cname)}"
@@ -111,8 +111,6 @@
           <% iden = hasattr(thing, "captcha") and thing.captcha.iden or '' %>
           ${captchagen(iden, tabulate=True, label=False, size=30, tabindex=tabindex)}
           %endif
-          ${error_field("RATELIMIT", "ratelimit")}
-          ${error_field("RATELIMIT", "vdelay")}
         </li>
       %endif
       <li>
@@ -135,6 +133,10 @@
         </button>
         <span class="throbber"></span>
         <span class="status"></span>
+        %if register:
+          ${error_field("RATELIMIT", "ratelimit")}
+          ${error_field("RATELIMIT", "vdelay")}
+        %endif
       </p>
     </div>
   </form>

@@ -16,10 +16,11 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
+from ConfigParser import SafeConfigParser
 from datetime import datetime, timedelta
 from r2.lib.db import tdb_cassandra
 from r2.lib.db.thing import NotFound
@@ -27,9 +28,13 @@ from r2.lib.merge import *
 from pycassa.system_manager import TIME_UUID_TYPE
 from pylons import c, g
 from pylons.controllers.util import abort
+from r2.lib.db.tdb_cassandra import NotFound
 from r2.models.printable import Printable
 from r2.models.account import Account
 from collections import OrderedDict
+from StringIO import StringIO
+
+import pycassa.types
 
 # Used for the key/id for pages,
 PAGE_ID_SEP = '\t'
@@ -48,12 +53,19 @@ impossible_namespaces = ('edit/', 'revisions/', 'settings/', 'discussions/',
 restricted_namespaces = ('reddit/', 'config/', 'special/')
 
 # Pages which may only be edited by mods, must be within restricted namespaces
-special_pages = ('config/stylesheet', 'config/sidebar', 'config/description')
+special_pages = ('config/stylesheet', 'config/sidebar',
+                 'config/submit_text', 'config/description')
 
 # Pages which have a special length restrictions (In bytes)
-special_length_restrictions_bytes = {'config/stylesheet': 128*1024, 'config/sidebar': 5120, 'config/description': 500}
+special_length_restrictions_bytes = {
+    'config/stylesheet': 128*1024,
+    'config/submit_text': 1024,
+    'config/sidebar': 5120,
+    'config/description': 500
+}
 
 modactions = {'config/sidebar': "Updated subreddit sidebar",
+              'config/submit_text': "Updated submission text",
               'config/description': "Updated subreddit description"}
 
 # Page "index" in the subreddit "reddit.com" and a seperator of "\t" becomes:
@@ -69,6 +81,9 @@ class ContentLengthError(Exception):
 class WikiPageExists(Exception):
     pass
 
+class WikiBadRevision(Exception):
+    pass
+
 class WikiPageEditors(tdb_cassandra.View):
     _use_db = True
     _value_type = 'str'
@@ -81,8 +96,9 @@ class WikiRevision(tdb_cassandra.UuidThing, Printable):
     _connection_pool = 'main'
     
     _str_props = ('pageid', 'content', 'author', 'reason')
-    _bool_props = ('hidden')
-    
+    _bool_props = ('hidden', 'admin_deleted')
+    _defaults = {'admin_deleted': False}
+
     cache_ignore = set(list(_str_props)).union(Printable.cache_ignore).union(['wikipage'])
     
     def get_author(self):
@@ -119,7 +135,7 @@ class WikiRevision(tdb_cassandra.UuidThing, Printable):
     def get(cls, revid, pageid):
         wr = cls._byID(revid)
         if wr.pageid != pageid:
-            raise ValueError('Revision is not for the expected page')
+            raise WikiBadRevision('Revision is not for the expected page')
         return wr
     
     def toggle_hide(self):
@@ -183,8 +199,9 @@ class WikiPage(tdb_cassandra.Thing):
     _date_props = ('last_edit_date')
     _str_props = ('revision', 'name', 'last_edit_by', 'content', 'sr')
     _int_props = ('permlevel')
-    _bool_props = ('listed_')
-    
+    _bool_props = ('listed')
+    _defaults = {'listed': True}
+
     def get_author(self):
         if self._get('last_edit_by'):
             return Account._byID36(self.last_edit_by, data=True)
@@ -216,7 +233,7 @@ class WikiPage(tdb_cassandra.Thing):
         if not name or not sr:
             raise ValueError
         name = name.lower()
-        kw = dict(sr=sr._id36, name=name, permlevel=0, content='', listed_=False)
+        kw = dict(sr=sr._id36, name=name, permlevel=0, content='')
         page = cls(**kw)
         page._commit()
         return page
@@ -258,13 +275,17 @@ class WikiPage(tdb_cassandra.Thing):
     
     @classmethod
     def get_pages(cls, sr, after=None, filter_check=None):
-        NUM_AT_A_TIME = 1000
-        pages = WikiPagesBySR.query([sr._id36], after=after, count=NUM_AT_A_TIME)
-        pages = list(pages)
-        if len(pages) >= NUM_AT_A_TIME:
-            return pages + cls.get_pages(sr, after=pages[-1])
-        pages = filter(filter_check, pages)
-        return pages
+        NUM_AT_A_TIME = num = 1000
+        pages = []
+        while num >= NUM_AT_A_TIME:
+            wikipages = WikiPagesBySR.query([sr._id36],
+                                            after=after,
+                                            count=NUM_AT_A_TIME)
+            wikipages = list(wikipages)
+            num = len(wikipages)
+            pages += wikipages
+            after = wikipages[-1] if num else None
+        return filter(filter_check, pages)
     
     @classmethod
     def get_listing(cls, sr, filter_check=None):
@@ -341,7 +362,7 @@ class WikiPage(tdb_cassandra.Thing):
         self.content = content
         self.last_edit_by = author
         self.last_edit_date = wr.date
-        self.revision = wr._id
+        self.revision = str(wr._id)
         self._commit()
         return wr
     
@@ -402,3 +423,71 @@ class WikiRevisionsRecentBySR(tdb_cassandra.DenormalizedView):
         return wr.sr
 
 
+class ImagesByWikiPage(tdb_cassandra.View):
+    _use_db = True
+    _read_consistency_level = tdb_cassandra.CL.QUORUM
+    _write_consistency_level = tdb_cassandra.CL.QUORUM
+    _extra_schema_creation_args = {
+        "key_validation_class": pycassa.types.AsciiType(),
+        "column_name_class": pycassa.types.UTF8Type(),
+        "default_validation_class": pycassa.types.UTF8Type(),
+    }
+
+    @classmethod
+    def add_image(cls, sr, page_name, image_name, url):
+        rowkey = WikiPage.id_for(sr, page_name)
+        cls._set_values(rowkey, {image_name: url})
+
+    @classmethod
+    def get_images(cls, sr, page_name):
+        try:
+            rowkey = WikiPage.id_for(sr, page_name)
+            return cls._byID(rowkey)._values()
+        except tdb_cassandra.NotFound:
+            return {}
+
+    @classmethod
+    def get_image_count(cls, sr, page_name):
+        rowkey = WikiPage.id_for(sr, page_name)
+        return cls._cf.get_count(rowkey,
+            read_consistency_level=cls._read_consistency_level)
+
+    @classmethod
+    def delete_image(cls, sr, page_name, image_name):
+        rowkey = WikiPage.id_for(sr, page_name)
+        cls._remove(rowkey, [image_name])
+
+
+class WikiPageIniItem(object):
+    _bool_values = ("is_enabled", "is_new")
+
+    @classmethod
+    def get_all(cls, return_dict=False):
+        items = OrderedDict()
+        try:
+            wp = WikiPage.get(*cls._get_wiki_config())
+        except NotFound:
+            return items if return_dict else items.values()
+        wp_content = StringIO(wp.content)
+        cfg = SafeConfigParser(allow_no_value=True)
+        cfg.readfp(wp_content)
+
+        for section in cfg.sections():
+            def_values = {'id': section}
+            for name, value in cfg.items(section):
+                # coerce boolean variables
+                if name in cls._bool_values:
+                    def_values[name] = cfg.getboolean(section, name)
+                else:
+                    def_values[name] = value
+
+            try:
+                item = cls(**def_values)
+            except TypeError:
+                # a required variable wasn't set for this item, skip
+                continue
+
+            if item.is_enabled:
+                items[section] = item
+        
+        return items if return_dict else items.values()

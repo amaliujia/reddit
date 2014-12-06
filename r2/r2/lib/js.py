@@ -400,10 +400,14 @@ catch_errors = "try {{ {content} }} catch (err) {{ r.sendError('Error running mo
 
 module["reddit-init-base"] = LocalizedModule("reddit-init-base.js",
     "lib/es5-shim.js",
+    "lib/modernizr.js",
     "lib/json2.js",
     "lib/underscore-1.4.4.js",
     "lib/store.js",
     "lib/jed.js",
+    "lib/bootstrap.transition.js",
+    "lib/bootstrap.tooltip.js",
+    "bootstrap.tooltip.extension.js",
     "base.js",
     "preload.js",
     "logging.js",
@@ -414,6 +418,8 @@ module["reddit-init-base"] = LocalizedModule("reddit-init-base.js",
     "utils.js",
     "analytics.js",
     "jquery.reddit.js",
+    "stateify.js",
+    "validator.js",
     "reddit.js",
     "spotlight.js",
     localized_appendices=[
@@ -488,9 +494,10 @@ module["policies"] = Module("policies.js",
 )
 
 
-module["sponsored"] = Module("sponsored.js",
+module["sponsored"] = LocalizedModule("sponsored.js",
     "lib/ui.core.js",
     "lib/ui.datepicker.js",
+    "lib/react-0.11.2.js",
     "sponsored.js"
 )
 

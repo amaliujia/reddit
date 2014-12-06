@@ -21,6 +21,7 @@
 ###############################################################################
 
 <%! 
+   from r2.config import feature
    from r2.lib.template_helpers import add_sr, static, join_urls, class_dict, get_domain
    from r2.lib.filters import unsafe
    from r2.lib.pages import SearchForm, ClickGadget, SideContentBox, Login, ListingChooser
@@ -45,6 +46,11 @@
 
 <%def name="global_stylesheets()">
   ${less_stylesheet("reddit.less")}
+  %if feature.is_enabled('new_markdown_style'):
+    ${less_stylesheet("markdown.less")}
+  %else:
+    ${less_stylesheet("old-markdown.less")}
+  %endif
   %if c.site.stylesheet:
     <link rel="stylesheet" href="${static(c.site.stylesheet)}" type="text/css" >
   %endif
@@ -157,16 +163,38 @@
 
     %if not c.user_is_loggedin and not g.read_only_mode:
       %if thing.enable_login_cover:
-      <div class="login-popup cover-overlay" style="display: none">
-        <div class="cover" onclick="return hidecover(this)"></div>
-        <div class="popup">
-          <a href="#" onclick="return hidecover(this)" class="hidecover">
-            ${_("close this window")}
-          </a>
-          <h1 class="cover-msg">${strings.cover_msg}</h1>
-          ${Login(is_popup=True)}
-        </div>
-      </div>
+        %if feature.is_enabled('new_login_flow'):
+          <script>
+            var BETA_HOST = 'beta.reddit.com';
+            if (location.host === BETA_HOST) {
+              r.config.https_endpoint = 'https://' + BETA_HOST;
+            }
+          </script>
+          <div id="login-popup-v2" class="login-popup cover-overlay" tabindex="-1" style="display: none">
+            <div class="cover"></div>
+            <div class="popup-v2">
+              <a href="javascript: void 0;" class="hidecover c-hide-text">
+                ${_("close this window")}
+              </a>
+              <div class="clear"></div>
+              <div class="popup-v2-body">
+                <h2 class="cover-msg">${strings.cover_msg}</h2>
+                ${Login(is_popup=True)}
+              </div>
+            </div>
+          </div>
+        %else:
+          <div class="login-popup cover-overlay" style="display: none">
+            <div class="cover" onclick="return hidecover(this)"></div>
+            <div class="popup">
+              <a href="#" onclick="return hidecover(this)" class="hidecover">
+                ${_("close this window")}
+              </a>
+              <h1 class="cover-msg">${strings.cover_msg}</h1>
+              ${Login(is_popup=True)}
+            </div>
+          </div>
+        %endif
       %endif
       <div class="lang-popup cover-overlay" style="display: none">
         <div class="cover" onclick="return hidecover(this)"></div>

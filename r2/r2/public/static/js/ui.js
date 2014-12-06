@@ -86,10 +86,15 @@ r.ui.initLiveTimestamps = function() {
 }
 
 r.ui.initTimings = function() {
-  // sample at a rate of 5%
-  if (Math.random() > 0.05) { return }
+  // return if we're not configured for sending stats
+  if (!r.config.pageInfo.actionName || !r.config.stats_domain) {
+    return
+  }
 
-  if (!r.config.pageInfo.actionName) { return }
+  // Sample based on the configuration sample rate
+  if (Math.random() > r.config.stats_sample_rate / 100) {
+    return
+  }
 
   var browserTimings = new r.NavigationTimings()
 
@@ -116,18 +121,13 @@ r.ui.initTimings = function() {
       timingData.actionName = r.config.pageInfo.actionName
       timingData.verification = r.config.pageInfo.verification
 
-      $.post('/web/timings', timingData)
-
-      // Sample at 1% of 1% for now
-      if (Math.random() <= 0.01 && r.config.stats_domain ) {
-        $.ajax({
-          type: 'POST',
-          url: r.config.stats_domain,
-          data: JSON.stringify({ rum: timingData  }),
-          contentType: 'application/json; charset=utf-8',
-          dataType: 'json',
-        })
-      }
+      $.ajax({
+        type: 'POST',
+        url: r.config.stats_domain,
+        data: JSON.stringify({ rum: timingData  }),
+        contentType: 'application/json; charset=utf-8',
+        dataType: 'json',
+      })
     })
   })
 }
@@ -184,33 +184,58 @@ r.ui.Form = function(el) {
         e.preventDefault()
         this.submit(e)
     }, this))
+
+    this.$el.find('[data-validate-url]')
+        .validator()
+        .on('initialize.validator', function(e) {
+            var $el = $(this);
+
+            if ($el.hasClass('c-has-error')) {
+                $el.stateify('showError');
+            }
+        })
+        .on('valid.validator', function(e) {
+            $(this).stateify('set', 'success');
+        })
+        .on('invalid.validator', function(e, resp) {
+            var error = r.utils.parseError(resp.errors[0]);
+
+            $(this).stateify('set', 'error', error.message);
+        })
+        .on('loading.validator', function(e) {
+            $(this).stateify('set', 'loading');
+        })
+        .on('cleared.validator', function(e) {
+            $(this).stateify('clear');
+        });
 }
 r.ui.Form.prototype = $.extend(new r.ui.Base(), {
     showStatus: function(msg, isError) {
-        this.$el.find('.status')
+        this.$el.find('.status, .c-alert')
             .show()
             .toggleClass('error', !!isError)
             .text(msg)
     },
 
     showErrors: function(errors) {
-        statusMsgs = []
-        $.each(errors, $.proxy(function(i, err) {
-            var errName = err[0],
-                errMsg = err[1],
-                errField = err[2],
-                errCls = '.error.'+errName + (errField ? '.field-'+errField : ''),
-                errEl = this.$el.find(errCls)
+        var messages = [];
 
-            if (errEl.length) {
-                errEl.show().text(errMsg)
+        $.each(errors, $.proxy(function(i, err) {
+            var obj = r.utils.parseError(err);
+            var $el = this.$el.find('.error.' + obj.name + (obj.field ? '.field-' + obj.field : ''));
+            var $v2el = this.$el.filter('.form-v2').find('[name="' + obj.field + '"]');
+
+            if ($el.length) {
+                $el.show().text(obj.message);
+            } else if ($v2el.length) {
+                $v2el.stateify('set', 'error', obj.message);
             } else {
-                statusMsgs.push(errMsg)
+                messages.push(obj.message);
             }
         }, this))
 
-        if (statusMsgs.length) {
-            this.showStatus(statusMsgs.join(', '), true)
+        if (messages.length) {
+            this.showStatus(messages.join(', '), true);
         }
     },
 

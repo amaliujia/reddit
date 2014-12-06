@@ -77,6 +77,7 @@ class Link(Thing, Printable):
                      media_object=None,
                      secure_media_object=None,
                      media_url=None,
+                     gifts_embed_url=None,
                      media_autoplay=False,
                      domain_override=None,
                      promoted=None,
@@ -812,6 +813,7 @@ class Comment(Thing, Printable):
                      banned_before_moderator=False,
                      parents=None,
                      ignore_reports=False,
+                     sendreplies=True,
                      )
     _essentials = ('link_id', 'author_id')
 
@@ -860,9 +862,10 @@ class Comment(Thing, Printable):
 
         to = None
         name = 'inbox'
-        if parent:
+        if parent and parent.sendreplies:
             to = Account._byID(parent.author_id, True)
-        elif link.sendreplies:
+
+        if not parent and link.sendreplies:
             to = Account._byID(link.author_id, True)
             name = 'selfreply'
 
@@ -1106,10 +1109,9 @@ class Comment(Thing, Printable):
             item.can_gild = (
                 # this is a way of checking if the user is logged in that works
                 # both within CommentPane instances and without.  e.g. CommentPane
-                # explicitly sets user_is_loggedin = False but can_reply is
-                # correct.  while on user overviews, you can't reply but will get
-                # the correct value for user_is_loggedin
-                (c.user_is_loggedin or getattr(item, "can_reply", True)) and
+                # explicitly sets user_is_loggedin = False but can_save will
+                # always be True if the user is logged in
+                item.can_save and
                 # you can't gild your own comment
                 not (c.user_is_loggedin and
                      item.author and
@@ -1169,16 +1171,21 @@ class Comment(Thing, Printable):
                     item.subreddit_path += item.subreddit.path
 
             # always use the default collapse threshold in contest mode threads
-            if item.link.contest_mode:
+            # if the user has a custom collapse threshold
+            if (item.link.contest_mode and 
+                    user.pref_min_comment_score is not None):
                 min_score = Account._defaults['pref_min_comment_score']
             else:
                 min_score = user.pref_min_comment_score
 
             item.collapsed = False
+            distinguished = item.distinguished and item.distinguished != "no"
+            prevent_collapse = profilepage or user_is_admin or distinguished
+
             if (item.deleted and item.subreddit.collapse_deleted_comments and
-                    not (profilepage or user_is_admin)):
+                    not prevent_collapse):
                 item.collapsed = True
-            elif item.score < min_score and not (profilepage or user_is_admin):
+            elif item.score < min_score and not prevent_collapse:
                 item.collapsed = True
                 item.collapsed_reason = _("comment score below threshold")
             elif user_is_loggedin and item.author_id in c.user.enemies:
@@ -1232,6 +1239,9 @@ class Comment(Thing, Printable):
                 item.voting_score = [
                     item.score - 1, item.score, item.score + 1]
                 item.collapsed = False
+
+            if item.is_author:
+                item.inbox_replies_enabled = item.sendreplies
 
             #will seem less horrible when add_props is in pages.py
             from r2.lib.pages import UserText
@@ -1367,7 +1377,10 @@ class Message(Thing, Printable):
                      sr_id=None,
                      to_collapse=None,
                      author_collapse=None,
-                     from_sr=False)
+                     from_sr=False,
+                     display_author=None,
+                     display_to=None,
+                     )
     _data_int_props = Thing._data_int_props + ('reported',)
     _essentials = ('author_id',)
     cache_ignore = set(["to", "subreddit"]).union(Printable.cache_ignore)
@@ -1615,6 +1628,13 @@ class Message(Thing, Printable):
                         item.message_style = "mention"
             elif item.sr_id is not None:
                 item.subreddit = m_subreddits[item.sr_id]
+            else:
+                if item.display_author:
+                    item.author = Account._byID(item.display_author)
+                if item.display_to:
+                    item.to = Account._byID(item.display_to)
+                    if item.to_id == c.user._id:
+                        item.body = strings.anonymous_gilder_warning + item.body
 
             item.hide_author = False
             item.is_collapsed = None
@@ -1640,10 +1660,12 @@ class Message(Thing, Printable):
                 if not c.user_is_admin:
                     item.subject = _('[message from blocked user]')
                     item.body = _('[unblock user to see this message]')
+
             taglinetext = ''
             if item.hide_author:
                 taglinetext = _("subreddit message %(author)s sent %(when)s")
-            elif item.author_id == c.user._id:
+            elif (item.author_id == c.user._id and
+                  not getattr(item, "display_author", None)):
                 taglinetext = _("to %(dest)s sent %(when)s")
             elif (item._id in mod_message_authors and
                     (item.subreddit.is_moderator(c.user) or c.user_is_admin)):

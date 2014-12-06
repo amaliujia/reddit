@@ -82,6 +82,15 @@ if [ "$DISTRIB_ID" != "Ubuntu" -o "$DISTRIB_RELEASE" != "12.04" ]; then
     exit 1
 fi
 
+if [[ "2000000" -gt $(awk '/MemTotal/{print $2}' /proc/meminfo) ]]; then
+    LOW_MEM_PROMPT="reddit requires at least 2GB of memory to work properly, continue anyway? [y/n] "
+    read -er -n1 -p "$LOW_MEM_PROMPT" response
+    if [[ "$response" != "y" ]]; then
+      echo "Quitting."
+      exit 1
+    fi
+fi
+
 ###############################################################################
 # Install prerequisites
 ###############################################################################
@@ -310,7 +319,6 @@ plugins = $plugin_str
 media_provider = filesystem
 media_fs_root = /srv/www/media
 media_fs_base_url_http = http://%(domain)s/media/
-media_fs_base_url_https = https://%(domain)s/media/
 
 [server:main]
 port = 8001
@@ -330,17 +338,40 @@ fi
 ###############################################################################
 # some useful helper scripts
 ###############################################################################
-cat > /usr/local/bin/reddit-run <<REDDITRUN
+function helper-script() {
+    cat > $1
+    chmod 755 $1
+}
+
+helper-script /usr/local/bin/reddit-run <<REDDITRUN
 #!/bin/bash
 exec paster --plugin=r2 run $REDDIT_HOME/src/reddit/r2/run.ini "\$@"
 REDDITRUN
 
-cat > /usr/local/bin/reddit-shell <<REDDITSHELL
+helper-script /usr/local/bin/reddit-shell <<REDDITSHELL
 #!/bin/bash
 exec paster --plugin=r2 shell $REDDIT_HOME/src/reddit/r2/run.ini
 REDDITSHELL
 
-chmod 755 /usr/local/bin/reddit-run /usr/local/bin/reddit-shell
+helper-script /usr/local/bin/reddit-start <<REDDITSTART
+#!/bin/bash
+initctl emit reddit-start
+REDDITSTART
+
+helper-script /usr/local/bin/reddit-stop <<REDDITSTOP
+#!/bin/bash
+initctl emit reddit-stop
+REDDITSTOP
+
+helper-script /usr/local/bin/reddit-restart <<REDDITRESTART
+#!/bin/bash
+initctl emit reddit-restart TARGET=${1:-all}
+REDDITRESTART
+
+helper-script /usr/local/bin/reddit-flush <<REDDITFLUSH
+#!/bin/bash
+echo flush_all | nc localhost 11211
+REDDITFLUSH
 
 ###############################################################################
 # pixel and click server
@@ -749,16 +780,25 @@ Cron jobs start with "reddit-job-" and queue processors start with
 "reddit-consumer-". The crons are managed by /etc/cron.d/reddit. You can
 initiate a restart of all the consumers by running:
 
-    sudo initctl emit reddit-restart
+    sudo reddit-restart
 
 or target specific ones:
 
-    sudo initctl emit reddit-restart TARGET=scraper_q
+    sudo reddit-restart scraper_q
 
 See the GitHub wiki for more information on these jobs:
 
 * https://github.com/reddit/reddit/wiki/Cron-jobs
 * https://github.com/reddit/reddit/wiki/Services
+
+The reddit code can be shut down or started up with
+
+    sudo reddit-stop
+    sudo reddit-start
+
+And if you think caching might be hurting you, you can flush memcache with
+
+    reddit-flush
 
 Now that the core of reddit is installed, you may want to do some additional
 steps:

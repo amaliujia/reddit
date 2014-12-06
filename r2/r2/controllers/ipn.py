@@ -251,9 +251,15 @@ def send_gift(buyer, recipient, months, days, signed, giftmessage,
     if signed:
         sender = buyer.name
         md_sender = "[%s](/user/%s)" % (sender, sender)
+        repliable = False
     else:
         sender = _("An anonymous redditor")
         md_sender = _("An anonymous redditor")
+        
+        if buyer.name in g.live_config["proxy_gilding_accounts"]:
+            repliable = False
+        else:    
+            repliable = True
 
     create_gift_gold(buyer._id, recipient._id, days, c.start_time, signed, note)
 
@@ -282,9 +288,15 @@ def send_gift(buyer, recipient, months, days, signed, giftmessage,
         message += '\n* ' + strings.lounge_msg
     message = append_random_bottlecap_phrase(message)
 
+    if not signed:
+        if not repliable:
+            message += '\n\n' + strings.unsupported_respond_to_gilder
+        else:
+            message += '\n\n' + strings.respond_to_anonymous_gilder
+
     try:
-        send_system_message(recipient, subject, message,
-                            distinguished='gold-auto')
+        send_system_message(recipient, subject, message, author=buyer,
+                            distinguished='gold-auto', repliable=repliable)
     except MessageError:
         g.log.error('send_gift: could not send system message')
 
@@ -1215,7 +1227,7 @@ class RedditGiftsController(GoldPaymentController):
         if goldtype == 'gift':
             gift_kw = {
                 'recipient': Account._by_name(data['recipient']),
-                'giftmessage': _force_utf8(data.get('giftmessage', None)),
+                'giftmessage': _force_unicode(data.get('giftmessage', None)),
                 'signed': data.get('signed') == 'True',
             }
         else:

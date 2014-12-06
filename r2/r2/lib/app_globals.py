@@ -218,10 +218,10 @@ class Globals(object):
             'trust_local_proxies',
             'shard_link_vote_queues',
             'shard_commentstree_queues',
-            'subreddit_stylesheets_static',
             'ENFORCE_RATELIMIT',
             'RL_SITEWIDE_ENABLED',
             'RL_OAUTH_SITEWIDE_ENABLED',
+            'RL_STRICT_ENFORCEMENT',
         ],
 
         ConfigValue.tuple: [
@@ -261,6 +261,11 @@ class Globals(object):
             'wiki_page_privacy_policy',
             'wiki_page_user_agreement',
             'wiki_page_gold_bottlecaps',
+            'fraud_email',
+            'feedback_email',
+            'share_reply',
+            'nerds_email',
+            'smtp_server',
         ],
 
         ConfigValue.choice(ONE=CL_ONE, QUORUM=CL_QUORUM): [

@@ -527,12 +527,12 @@ class VCssMeasure(Validator):
 subreddit_rx = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_]{2,20}\Z")
 language_subreddit_rx = re.compile(r"\A[a-z]{2}\Z")
 
-def chksrname(x, allow_language_srs=False):
+def chksrname(x, allow_language_srs=False, allow_special_srs=False):
     if not x:
         return None
 
     #notice the space before reddit.com
-    if x in ('friends', 'all', ' reddit.com'):
+    if not allow_special_srs and x in ('friends', 'all', ' reddit.com'):
         return False
 
     try:
@@ -549,12 +549,16 @@ class VLength(Validator):
     only_whitespace = re.compile(r"\A\s*\Z", re.UNICODE)
 
     def __init__(self, param, max_length,
+                 min_length=0,
                  empty_error = errors.NO_TEXT,
                  length_error = errors.TOO_LONG,
+                 short_error=errors.TOO_SHORT,
                  **kw):
         Validator.__init__(self, param, **kw)
         self.max_length = max_length
+        self.min_length = min_length
         self.length_error = length_error
+        self.short_error = short_error
         self.empty_error = empty_error
 
     def run(self, text, text2 = ''):
@@ -563,6 +567,9 @@ class VLength(Validator):
             self.set_error(self.empty_error, code=400)
         elif len(text) > self.max_length:
             self.set_error(self.length_error, {'max_length': self.max_length}, code=400)
+        elif len(text) < self.min_length:
+            self.set_error(self.short_error, {'min_length': self.min_length},
+                           code=400)
         else:
             return text
 
@@ -1138,12 +1145,14 @@ class VSrCanBan(VByName):
             return True
         elif c.user_is_loggedin:
             item = VByName.run(self, thing_name)
-            # will throw a legitimate 500 if this isn't a link or
-            # comment, because this should only be used on links and
-            # comments
-            subreddit = item.subreddit_slow
-            if subreddit.is_moderator_with_perms(c.user, 'posts'):
-                return True
+            if isinstance(item, (Link, Comment)):
+                sr = item.subreddit_slow
+                if sr.is_moderator_with_perms(c.user, 'posts'):
+                    return True
+            elif isinstance(item, Message):
+                sr = item.subreddit_slow
+                if sr and sr.is_moderator_with_perms(c.user, 'mail'):
+                    return True
         abort(403,'forbidden')
 
 class VSrSpecial(VByName):
@@ -1797,7 +1806,7 @@ class VDelay(Validator):
             seconds = g.RL_RESET_SECONDS
 
         key = "VDelay-%s-%s" % (category, request.ip)
-        prev_violations = g.memcache.get(key)
+        prev_violations = g.cache.get(key)
         if prev_violations is None:
             prev_violations = dict(count=0)
 
@@ -1819,7 +1828,7 @@ class VDelay(Validator):
         prev_violations["count"] += 1
 
         with g.make_lock("record_violation", "lock-" + key, timeout=5, verbose=False):
-            existing = g.memcache.get(key)
+            existing = g.cache.get(key)
             if existing and existing["count"] > prev_violations["count"]:
                 g.log.warning("Tried to set %s to count=%d, but found existing=%d"
                              % (key, prev_violations["count"], existing["count"]))

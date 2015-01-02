@@ -37,6 +37,7 @@ from r2.lib.validator import (
 )
 from r2.models import Account, Comment, Link, NotFound
 from r2.models.gold import creddits_lock
+from r2.lib.validator import VUser
 
 
 class APIv1GoldController(OAuth2ResourceController):
@@ -44,8 +45,9 @@ class APIv1GoldController(OAuth2ResourceController):
 
     def pre(self):
         OAuth2ResourceController.pre(self)
-        self.authenticate_with_token()
-        self.set_up_user_context()
+	if request.method != "OPTIONS":
+            self.authenticate_with_token()
+            self.set_up_user_context()
         self.run_sitewide_ratelimits()
 
     def try_pagecache(self):
@@ -89,6 +91,7 @@ class APIv1GoldController(OAuth2ResourceController):
 
     @require_oauth2_scope("creddits")
     @validate(
+        VUser(),
         target=VByName("fullname"),
     )
     @api_doc(
@@ -108,6 +111,7 @@ class APIv1GoldController(OAuth2ResourceController):
 
     @require_oauth2_scope("creddits")
     @validate(
+        VUser(),
         user=VAccountByName("username"),
         months=VInt("months", min=1, max=36),
     )

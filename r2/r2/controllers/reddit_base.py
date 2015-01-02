@@ -367,7 +367,8 @@ def set_subreddit():
         #reddits
         c.site = Sub
     elif '+' in sr_name:
-        sr_names = sr_name.split('+')
+        sr_names = filter(lambda name: chksrname(name, allow_language_srs=True,
+            allow_special_srs=True), sr_name.split('+'))
         srs = Subreddit._by_name(sr_names, stale=can_stale).values()
         if All in srs:
             c.site = All
@@ -375,13 +376,16 @@ def set_subreddit():
             c.site = Friends
         else:
             srs = [sr for sr in srs if not isinstance(sr, FakeSubreddit)]
-            multi_path = '/r/' + sr_name
-            if not srs:
-                c.site = MultiReddit(multi_path, [])
-            elif len(srs) == 1:
+            if len(srs) == 1:
                 c.site = srs[0]
-            else:
+            elif srs:
+                found = {sr.name.lower() for sr in srs}
+                sr_names = filter(lambda name: name.lower() in found, sr_names)
+                sr_name = '+'.join(sr_names)
+                multi_path = '/r/' + sr_name
                 c.site = MultiReddit(multi_path, srs)
+            elif not c.error_page:
+                abort(404)
     elif '-' in sr_name:
         sr_names = sr_name.split('-')
         base_sr_name, exclude_sr_names = sr_names[0], sr_names[1:]
@@ -548,7 +552,7 @@ def set_iface_lang():
     host_lang = request.environ.get('reddit-prefer-lang')
     lang = host_lang or c.user.pref_lang
 
-    if getattr(g, "lang_override") and lang.startswith("en"):
+    if getattr(g, "lang_override") and lang == "en":
         lang = g.lang_override
 
     c.lang = lang
@@ -976,11 +980,6 @@ class MinimalController(BaseController):
             client_id = c.oauth2_access_token.client_id.encode("ascii")
             # OAuth2 ratelimits are per user-app combination
             key = 'siterl-oauth-' + c.user._id36 + ":" + client_id
-        elif g.RL_STRICT_ENFORCEMENT:
-            type_ = "strict"
-            max_reqs = g.RL_MAX_REQS
-            period = g.RL_RESET_SECONDS
-            key = "siterl-strict-" + request.ip
         elif c.cdn_cacheable:
             type_ = "cdn"
         elif not is_api():
@@ -1096,6 +1095,9 @@ class MinimalController(BaseController):
 
         g.stats.count_string('user_agents', request.user_agent)
 
+        if is_subdomain(request.host, g.oauth_domain):
+            self.check_cors()
+
         if not self.defer_ratelimiting:
             self.run_sitewide_ratelimits()
             c.request_timer.intermediate("minimal-ratelimits")
@@ -1103,6 +1105,12 @@ class MinimalController(BaseController):
         hooks.get_hook("reddit.request.minimal_begin").call()
 
     def can_use_pagecache(self):
+        # Don't allow using pagecache if redirecting from an endpoint
+        # that disallowed it (for ex. redirecting from one that caches loggedin
+        # responses to one that doesn't)
+        if not request.environ.get("CAN_USE_PAGECACHE", True):
+            return False
+
         handler = self._get_action_handler()
         policy = getattr(handler, "pagecache_policy",
                          PAGECACHE_POLICY.LOGGEDOUT_ONLY)
@@ -1115,15 +1123,29 @@ class MinimalController(BaseController):
         return False
 
     def try_pagecache(self):
-        c.can_use_pagecache = self.can_use_pagecache()
+        can_use_pagecache = self.can_use_pagecache()
+        request.environ["CAN_USE_PAGECACHE"] = can_use_pagecache
 
-        if request.method.upper() == 'GET' and c.can_use_pagecache:
-            c.request_key = self.request_key()
+        # This guards against checking the pagecache twice and possibly
+        # modifying the request key when being redirected from one endpoint
+        # to the other in-request (i.e. when redirected to the error document)
+        if request.environ.get("TRIED_PAGECACHE", False):
+            return
+        request.environ["TRIED_PAGECACHE"] = True
+
+        if request.method.upper() == 'GET' and can_use_pagecache:
+            request.environ["REQUEST_KEY"] = self.request_key()
             try:
-                r = g.pagecache.get(c.request_key)
+                r = g.pagecache.get(request.environ["REQUEST_KEY"])
             except MemcachedError as e:
                 g.log.warning("pagecache error: %s", e)
                 return
+
+            # Store stats on pagecache hits / misses by endpoint
+            controller = request.environ['pylons.routes_dict']['controller']
+            action_name = request.environ['pylons.routes_dict']['action']
+            key = ".".join(("endpoint_pagecache", controller, action_name))
+            g.stats.event_count(key, "hit" if r else "miss", sample_rate=0.01)
 
             if r:
                 r, c.cookies = r
@@ -1172,15 +1194,15 @@ class MinimalController(BaseController):
         # such as If-Modified-Since headers for 304s or requesting IP for 429s.
         if (g.page_cache_time
             and request.method.upper() == 'GET'
-            and c.can_use_pagecache
-            and c.request_key
+            and request.environ.get("CAN_USE_PAGECACHE", False)
+            and request.environ.get("REQUEST_KEY", None)
             and not c.used_cache
             and not would_poison
             and response.status_int not in (304, 429)
             and not response.status.startswith("5")
             and not c.is_exception_response):
             try:
-                g.pagecache.set(c.request_key,
+                g.pagecache.set(request.environ["REQUEST_KEY"],
                                 (response._current_obj(), c.cookies),
                                 g.page_cache_time)
             except MemcachedError as e:
@@ -1192,7 +1214,7 @@ class MinimalController(BaseController):
         pragmas = [p.strip() for p in
                    request.headers.get("Pragma", "").split(",")]
         if g.debug or "x-reddit-pagecache" in pragmas:
-            if c.can_use_pagecache:
+            if request.environ.get("CAN_USE_PAGECACHE", False):
                 pagecache_state = "hit" if c.used_cache else "miss"
             else:
                 pagecache_state = "disallowed"
@@ -1248,7 +1270,7 @@ class MinimalController(BaseController):
 
     def check_cors(self):
         origin = request.headers.get("Origin")
-        if not origin:
+        if c.cors_checked or not origin:
             return
 
         method = request.method
@@ -1258,15 +1280,27 @@ class MinimalController(BaseController):
             if not method:
                 self.abort403()
 
-        action = request.environ["pylons.routes_dict"]["action_name"]
+        via_oauth = is_subdomain(request.host, g.oauth_domain)
+        if via_oauth:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = \
+                "GET, POST, PUT, PATCH, DELETE"
+            response.headers["Access-Control-Allow-Headers"] = \
+                "Authorization, "
+            response.headers["Access-Control-Allow-Credentials"] = "false"
+            response.headers['Access-Control-Expose-Headers'] = \
+                "X-Ratelimit-Used, X-Ratelimit-Remaining, X-Ratelimit-Reset"
+        else:
+            action = request.environ["pylons.routes_dict"]["action_name"]
 
-        handler = self._get_action_handler(action, method)
-        cors = handler and getattr(handler, "cors_perms", None)
+            handler = self._get_action_handler(action, method)
+            cors = handler and getattr(handler, "cors_perms", None)
 
-        if cors and cors["origin_check"](origin):
-            response.headers["Access-Control-Allow-Origin"] = origin
-            if cors.get("allow_credentials"):
-                response.headers["Access-Control-Allow-Credentials"] = "true"
+            if cors and cors["origin_check"](origin):
+                response.headers["Access-Control-Allow-Origin"] = origin
+                if cors.get("allow_credentials"):
+                    response.headers["Access-Control-Allow-Credentials"] = "true"
+        c.cors_checked = True
 
     def OPTIONS(self):
         """Return empty responses for CORS preflight requests"""
@@ -1308,11 +1342,15 @@ class OAuth2ResourceController(MinimalController):
             require(access_token)
             require(access_token.check_valid())
             c.oauth2_access_token = access_token
-            account = Account._byID36(access_token.user_id, data=True)
-            require(account)
-            require(not account._deleted)
-            c.user = c.oauth_user = account
-            c.user_is_loggedin = True
+            if access_token.user_id:
+                account = Account._byID36(access_token.user_id, data=True)
+                require(account)
+                require(not account._deleted)
+                c.user = c.oauth_user = account
+                c.user_is_loggedin = True
+            else:
+                c.user = UnloggedUser(get_browser_langs())
+                c.user_is_loggedin = False
             c.oauth_client = OAuth2Client._byID(access_token.client_id)
         except RequirementException:
             self._auth_error(401, "invalid_token")
@@ -1587,8 +1625,8 @@ class RedditController(OAuth2ResourceController):
         self._embed_html_timing_data()
 
         # allow logged-out JSON requests to be read cross-domain
-        if (request.method.upper() == "GET" and not c.user_is_loggedin and
-            c.render_style == "api"):
+        if (not c.cors_checked and request.method.upper() == "GET" and
+                not c.user_is_loggedin and c.render_style == "api"):
             response.headers["Access-Control-Allow-Origin"] = "*"
 
             request_origin = request.headers.get('Origin')

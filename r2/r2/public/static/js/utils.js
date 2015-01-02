@@ -181,7 +181,11 @@ r.utils = {
             message: message,
             field: field,
         }
-    }
+    },
+
+    onTrident: function() {
+        return 'ActiveXObject' in window;
+    },
 
 }
 

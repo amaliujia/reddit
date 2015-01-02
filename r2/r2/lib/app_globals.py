@@ -135,6 +135,12 @@ class PermissionFilteredEmployeeList(object):
         return "<PermissionFilteredEmployeeList %r>" % (list(self),)
 
 
+SHUTDOWN_CALLBACKS = []
+def on_app_shutdown(arbiter, worker):
+    for callback in SHUTDOWN_CALLBACKS:
+        callback()
+
+
 class Globals(object):
     spec = {
 
@@ -221,7 +227,6 @@ class Globals(object):
             'ENFORCE_RATELIMIT',
             'RL_SITEWIDE_ENABLED',
             'RL_OAUTH_SITEWIDE_ENABLED',
-            'RL_STRICT_ENFORCEMENT',
         ],
 
         ConfigValue.tuple: [
@@ -234,6 +239,7 @@ class Globals(object):
             'pagecaches',
             'memoizecaches',
             'srmembercaches',
+            'relcaches',
             'ratelimitcaches',
             'cassandra_seeds',
             'automatic_reddits',
@@ -474,6 +480,9 @@ class Globals(object):
         if self.media_domain == self.domain:
             print >> sys.stderr, ("Warning: g.media_domain == g.domain. " +
                    "This may give untrusted content access to user cookies")
+        if self.oauth_domain == self.domain:
+            print >> sys.stderr, ("Warning: g.oauth_domain == g.domain. "
+                    "CORS requests to g.domain will be allowed")
 
         for arg in sys.argv:
             tokens = arg.split("=")
@@ -519,6 +528,9 @@ class Globals(object):
             self.throttles = LiveList(self.zookeeper, "/throttles",
                                       map_fn=ipaddress.ip_network,
                                       reduce_fn=ipaddress.collapse_addresses)
+
+            # close our zk connection when the app shuts down
+            SHUTDOWN_CALLBACKS.append(self.zookeeper.stop)
         else:
             self.zookeeper = None
             parser = ConfigParser.RawConfigParser()
@@ -542,10 +554,11 @@ class Globals(object):
         num_mc_clients = self.num_mc_clients
 
         # the main memcache pool. used for most everything.
-        self.memcache = CMemcache(
+        memcache = CMemcache(
             self.memcaches,
             min_compress_len=50 * 1024,
             num_clients=num_mc_clients,
+            binary=True,
         )
 
         # a pool just used for @memoize results
@@ -553,6 +566,7 @@ class Globals(object):
             self.memoizecaches,
             min_compress_len=50 * 1024,
             num_clients=num_mc_clients,
+            binary=True,
         )
 
         # a pool just for srmember rels
@@ -560,6 +574,15 @@ class Globals(object):
             self.srmembercaches,
             min_compress_len=96,
             num_clients=num_mc_clients,
+            binary=True,
+        )
+
+        # a pool just for rels
+        relcaches = CMemcache(
+            self.relcaches,
+            min_compress_len=96,
+            num_clients=num_mc_clients,
+            binary=True,
         )
 
         ratelimitcaches = CMemcache(
@@ -571,6 +594,7 @@ class Globals(object):
         # a smaller pool of caches used only for distributed locks.
         # TODO: move this to ZooKeeper
         self.lock_cache = CMemcache(self.lockcaches,
+                                    binary=True,
                                     num_clients=num_mc_clients)
         self.make_lock = make_lock_factory(self.lock_cache, self.stats)
 
@@ -588,6 +612,7 @@ class Globals(object):
         # for data that's frequently fetched but doesn't need to be fresh.
         if self.stalecaches:
             stalecaches = CMemcache(self.stalecaches,
+                                    binary=True,
                                     num_clients=num_mc_clients)
         else:
             stalecaches = None
@@ -653,10 +678,10 @@ class Globals(object):
             self.cache = StaleCacheChain(
                 localcache_cls(),
                 stalecaches,
-                self.memcache,
+                memcache,
             )
         else:
-            self.cache = MemcacheChain((localcache_cls(), self.memcache))
+            self.cache = MemcacheChain((localcache_cls(), memcache))
         cache_chains.update(cache=self.cache)
 
         if stalecaches:
@@ -680,6 +705,17 @@ class Globals(object):
             self.srmembercache = MemcacheChain(
                 (localcache_cls(), srmembercaches))
         cache_chains.update(srmembercache=self.srmembercache)
+
+        if stalecaches:
+            self.relcache = StaleCacheChain(
+                localcache_cls(),
+                stalecaches,
+                relcaches,
+            )
+        else:
+            self.relcache = MemcacheChain(
+                (localcache_cls(), relcaches))
+        cache_chains.update(relcache=self.relcache)
 
         self.ratelimitcache = MemcacheChain(
                 (localcache_cls(), ratelimitcaches))
@@ -712,7 +748,7 @@ class Globals(object):
         # hardcache is used for various things that tend to expire
         # TODO: replace hardcache w/ cassandra stuff
         self.hardcache = HardcacheChain(
-            (localcache_cls(), self.memcache, HardCache(self)),
+            (localcache_cls(), memcache, HardCache(self)),
             cache_negative_results=True,
         )
         cache_chains.update(hardcache=self.hardcache)

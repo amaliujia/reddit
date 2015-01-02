@@ -206,7 +206,7 @@ class MessageButtons(PrintableButtons):
                                   permalink = permalink,
                                   was_comment = was_comment,
                                   unread = thing.new,
-                                  recipient = thing.recipient,
+                                  user_is_recipient = thing.user_is_recipient,
                                   can_reply = can_reply,
                                   parent_id = getattr(thing, "parent_id", None),
                                   show_report = True,
@@ -223,7 +223,7 @@ def default_thing_wrapper(**params):
             if thing.promoted is not None:
                 w.render_class = PromotedLink
             elif style == 'htmllite':
-                w.score_fmt = Score.points
+                w.score_fmt = Score.safepoints
             w.should_incr_counts = style != 'htmllite'
         return w
     params['parent_wrapper'] = _default_thing_wrapper

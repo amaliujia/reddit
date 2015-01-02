@@ -364,6 +364,9 @@ class OAuth2Client(Token):
 
     _developer_colname_prefix = 'has_developer_'
 
+    APP_TYPES = ("web", "installed", "script")
+    PUBLIC_APP_TYPES = ("installed",)
+
     @classmethod
     def _new(cls, **kwargs):
         if "secret" not in kwargs:
@@ -508,6 +511,10 @@ class OAuth2Client(Token):
             if token.client_id == self._id:
                 token.revoke()
 
+    def is_confidential(self):
+        return self.app_type not in self.PUBLIC_APP_TYPES
+
+
 class OAuth2ClientsByDeveloper(tdb_cassandra.View):
     """Index providing access to the list of OAuth2Clients of which an Account is a developer."""
 
@@ -557,18 +564,21 @@ class OAuth2AccessToken(Token):
     _ttl = datetime.timedelta(minutes=60)
     _defaults = dict(scope="",
                      token_type="bearer",
-                     refresh_token=None,
+                     refresh_token="",
+                     user_id="",
                     )
     _use_db = True
     _connection_pool = "main"
 
     @classmethod
-    def _new(cls, client_id, user_id, scope, refresh_token=None):
+    def _new(cls, client_id, user_id, scope, refresh_token=None, device_id=None):
         return super(OAuth2AccessToken, cls)._new(
                      client_id=client_id,
                      user_id=user_id,
                      scope=str(scope),
-                     refresh_token=refresh_token)
+                     refresh_token=refresh_token,
+                     device_id=device_id,
+        )
 
     @classmethod
     def _by_user_view(cls):
@@ -576,8 +586,8 @@ class OAuth2AccessToken(Token):
 
     def _on_create(self):
         """Updates the by-user view upon creation."""
-
-        self._by_user_view()._set_values(str(self.user_id), {self._id: ''})
+        if self.user_id:
+            self._by_user_view()._set_values(str(self.user_id), {self._id: ''})
         return super(OAuth2AccessToken, self)._on_create()
 
     def check_valid(self):
@@ -596,12 +606,13 @@ class OAuth2AccessToken(Token):
             return False
 
         # Is the user account still valid?
-        try:
-            account = Account._byID36(self.user_id)
-            if account._deleted:
-                raise NotFound
-        except NotFound:
-            return False
+        if self.user_id:
+            try:
+                account = Account._byID36(self.user_id)
+                if account._deleted:
+                    raise NotFound
+            except NotFound:
+                return False
 
         return True
 
@@ -611,14 +622,15 @@ class OAuth2AccessToken(Token):
         self.revoked = True
         self._commit()
 
-        try:
-            tba = self._by_user_view()._byID(self.user_id)
-            del tba[self._id]
-        except (tdb_cassandra.NotFound, KeyError):
-            # Not fatal, since self.check_valid() will still be False.
-            pass
-        else:
-            tba._commit()
+        if self.user_id:
+            try:
+                tba = self._by_user_view()._byID(self.user_id)
+                del tba[self._id]
+            except (tdb_cassandra.NotFound, KeyError):
+                # Not fatal, since self.check_valid() will still be False.
+                pass
+            else:
+                tba._commit()
 
     @classmethod
     def revoke_all_by_user(cls, account):

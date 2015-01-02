@@ -1880,6 +1880,7 @@ class DomainSR(FakeSubreddit):
 
     def __init__(self, domain):
         FakeSubreddit.__init__(self)
+        domain = domain.lower()
         self.domain = domain
         self.name = domain 
         self.title = _("%(domain)s on %(reddit.com)s") % {
@@ -1924,6 +1925,7 @@ class SRMember(Relation(Subreddit, Account)):
     _defaults = dict(encoded_permissions=None)
     _permission_class = None
     _cache = g.srmembercache
+    _fast_cache = g.srmembercache
 
     def has_permission(self, perm):
         """Returns whether this member has explicitly been granted a permission.

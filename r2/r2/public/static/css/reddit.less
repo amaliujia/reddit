@@ -2132,7 +2132,7 @@ textarea.gray { color: gray; }
 
 .message.collapsed {
     > .entry {
-        > .buttons, > .md {
+        .buttons, .md {
             display: none;
         }   
     }
@@ -3154,9 +3154,13 @@ li.searchfacet {
     }
 }
 
+.login-disclaimer {
+    color: #6a6a6a;
+}
+
 .split-panel {
     .clearfix();
-    margin-bottom: 30px;
+    margin-bottom: 49px;
 
     .split-panel-section-responsive(@panel-break-point: @screen-sm-min;) {
         float: none;
@@ -4774,7 +4778,8 @@ ul#image-preview-list .description pre {
 
 #sr-drop-down {
     position: absolute;
-    width: 498px;
+    width: 100%;
+    margin: 0;
     border: 1px solid gray;
     background: white;
     display: none;
@@ -6157,6 +6162,7 @@ div #campaign-field {
         }
     }
 
+    .lookup-user-field,
     .budget-field,
     .timing-field {
         .group {
@@ -6252,6 +6258,10 @@ div #campaign-field {
             text-align: right;
             padding: 0 4px;
         }
+    }
+
+    .lookup-user input[name=name] {
+        width: 10em;
     }
 }
 
@@ -6723,6 +6733,16 @@ div #campaign-field {
             margin-right:  150px;
         }
     }
+
+    .lookup-user-field {
+        .linefield-content {
+            display: flex;
+        }
+        .form-group,
+        .lookup-user-results {
+
+        }
+    }   
 }
 
 .geotargeting-disabled {
@@ -7900,7 +7920,7 @@ body:not(.gold) .allminus-link {
     }
 }
 
-.gold-payment form {
+.gold-wrap form {
     display: inline;
 }
 

@@ -672,7 +672,7 @@ class ApiController(RedditController):
     @cross_domain(allow_credentials=True)
     @api_doc(api_section.account, extends=_handle_register)
     def POST_register(self, *args, **kwargs):
-        """Register a new account.
+        """Create a new account.
 
         `rem` specifies whether or not the session cookie returned should last
         beyond the current browser session (that is, if `rem` is `True` the
@@ -1081,7 +1081,7 @@ class ApiController(RedditController):
             return
 
         form.set_text('.status',
-                      _('all other sessions have been logged out'))
+                      _('all other sessions have been signed out'))
         form.set_inputs(curpass = "")
 
         # deauthorize all access tokens
@@ -1299,7 +1299,7 @@ class ApiController(RedditController):
                    confirm = VBoolean("confirm"))
     @api_doc(api_section.account)
     def POST_delete_user(self, form, jquery, delete_message, username, user, confirm):
-        """Delete the currently logged in account.
+        """Delete the currently signed in account.
 
         A valid username/password and confirmation must be supplied. An
         optional `delete_message` may be supplied to explain the reason the
@@ -1536,7 +1536,11 @@ class ApiController(RedditController):
         # if it is a message that is being reported, ban it.
         # every user is admin over their own personal inbox
         if isinstance(thing, Message):
-            if c.user._id != thing.to_id:
+            # Ensure the message is either to them directly or indirectly
+            # (through modmail), to prevent unauthorized banning through
+            # spoofing.
+            if (c.user._id != thing.to_id and
+                    not (sr and c.user._id in sr.moderator_ids())):
                 abort(403)
             admintools.spam(thing, False, True, c.user.name)
         # auto-hide links that are reported
@@ -1557,7 +1561,7 @@ class ApiController(RedditController):
             Report.new(c.user, thing, reason)
             admintools.report(thing)
 
-        if isinstance(thing, Link):
+        if isinstance(thing, (Link, Message)):
             button = jquery(".id-%s .report-button" % thing._fullname)
         elif isinstance(thing, Comment):
             button = jquery(".id-%s .entry:first .report-button" % thing._fullname)
@@ -1636,6 +1640,9 @@ class ApiController(RedditController):
         if (form.has_errors('text', errors.NO_TEXT) or
                 form.has_errors("thing_id", errors.NOT_AUTHOR)):
             return
+
+        if isinstance(item, Link) and not item.is_self:
+            return abort(403, "forbidden")
 
         if isinstance(item, Comment):
             max_length = 10000
@@ -1815,24 +1822,24 @@ class ApiController(RedditController):
         # remove any null listings that may be present
         jquery("#noresults").hide()
 
-    @validatedForm(VUser(),
-                   VModhash(),
-                   VCaptcha(),
-                   VRatelimit(rate_user = True, rate_ip = True,
-                              prefix = "rate_share_"),
-                   share_from = VLength('share_from', max_length = 100),
-                   emails = ValidEmailsOrExistingUnames("share_to"),
-                   reply_to = ValidEmails("replyto", num = 1), 
-                   message = VLength("message", max_length = 1000), 
-                   thing = VByName('parent'),
-                   )
-    def POST_share(self, shareform, jquery, emails, thing, share_from, reply_to,
+    @validatedForm(
+        VUser(),
+        VModhash(),
+        VCaptcha(),
+        VRatelimit(rate_user=True, rate_ip=True, prefix="rate_share_"),
+        share_from=VLength('share_from', max_length=100),
+        emails=ValidEmailsOrExistingUnames("share_to"),
+        reply_to=ValidEmails("replyto", num=1), 
+        message=VLength("message", max_length=1000), 
+        link=VByName('parent', thing_cls=Link),
+    )
+    def POST_share(self, shareform, jquery, emails, link, share_from, reply_to,
                    message):
-        if not thing:
+        if not link:
             abort(404, 'not found')
 
         # remove the ratelimit error if the user's karma is high
-        sr = thing.subreddit_slow
+        sr = link.subreddit_slow
         should_ratelimit = sr.should_ratelimit(c.user, 'link')
         if not should_ratelimit:
             c.errors.remove((errors.RATELIMIT, 'ratelimit'))
@@ -1860,44 +1867,39 @@ class ApiController(RedditController):
             return abort(403, 'forbidden')
         else:
             emails, users = emails
-            c.user.add_share_emails(emails)
-            c.user._commit()
-            link = jquery.things(thing._fullname)
-            link.set_text(".share", _("shared"))
+            jquery.things(link._fullname).set_text(".share", _("shared"))
             shareform.html("<div class='clearleft'></div>"
                            "<p class='error'>%s</p>" % 
                            websafe(_("your link has been shared.")))
-            
-            # Set up the parts that are common between e-mail and PMs
-            urlparts = (get_domain(cname=c.cname, subreddit=False),
-                        thing._id36)
-            url = "http://%s/tb/%s" % urlparts
-            
-            if message:
-                message = message + "\n\n"
+
+            if getattr(link, "promoted", None) and link.disable_comments:
+                message = message + "\n\n" if message else ""
+                message += '\n%s\n\n%s\n\n' % (link.title, link.url)
             else:
-                message = ""
-            message = message + '\n%s\n\n%s\n\n' % (thing.title,url)
-            
-            # Deliberately not translating this, as it'd be in the
-            # sender's language
-            if thing.num_comments:
-                count = ("There are currently %(num_comments)s comments on " +
-                         "this link.  You can view them here:")
-                if thing.num_comments == 1:
-                    count = ("There is currently %(num_comments)s comment " +
-                             "on this link.  You can view it here:")
-                
-                numcom = count % {'num_comments':thing.num_comments}
-                message = message + "%s\n\n" % numcom
-            else:
-                message = message + "You can leave a comment here:\n\n"
-                
-            url = add_sr(thing.make_permalink_slow(), force_hostname=True)
-            message = message + url
+                urlparts = (get_domain(cname=c.cname, subreddit=False),
+                            link._id36)
+                url = "http://%s/tb/%s" % urlparts
+                message = message + "\n\n" if message else ""
+                message += '\n%s\n\n%s\n\n' % (link.title, url)
+
+                # Deliberately not translating this, as it'd be in the
+                # sender's language
+                if link.num_comments:
+                    count = ("There are currently %(num_comments)s comments " +
+                             "on this link.  You can view them here:")
+                    if link.num_comments == 1:
+                        count = ("There is currently %(num_comments)s " +
+                                 "comment on this link.  You can view it here:")
+                    numcom = count % {'num_comments': link.num_comments}
+                    message = message + "%s\n\n" % numcom
+                else:
+                    message = message + "You can leave a comment here:\n\n"
+
+                url = add_sr(link.make_permalink_slow(), force_hostname=True)
+                message = message + url
             
             # E-mail everyone
-            emailer.share(thing, emails, from_name = share_from or "",
+            emailer.share(link, emails, from_name = share_from or "",
                           body = message or "", reply_to = reply_to or "")
 
             # Send the PMs
@@ -2488,6 +2490,8 @@ class ApiController(RedditController):
             sr = thing.subreddit_slow
             action = 'remove' + thing.__class__.__name__.lower()
             ModAction.create(sr, c.user, action, **kw)
+
+        if isinstance(thing, Comment):
             queries.unnotify(thing)
 
 
@@ -2835,7 +2839,6 @@ class ApiController(RedditController):
                 item.child = None
         jquery.things(parent._fullname).parent().replace_things(a, False, True)
 
-    @csrf_exempt
     @require_oauth2_scope("read")
     @validatedForm(
         link=VByName('link_id'),
@@ -2849,7 +2852,7 @@ class ApiController(RedditController):
             docs={"id": "(optional) id of the associated MoreChildren object"}),
     )
     @api_doc(api_section.links_and_comments)
-    def POST_morechildren(self, form, jquery, link, sort, children,
+    def GET_morechildren(self, form, jquery, link, sort, children,
                           pv_hex, mc_id):
         """Retrieve additional comments omitted from a base comment tree.
 
@@ -2930,6 +2933,11 @@ class ApiController(RedditController):
             if lock:
                 lock.release()
 
+    @csrf_exempt
+    @require_oauth2_scope("read")
+    def POST_morechildren(self):
+        """Wrapper around `GET_morechildren` for backwards-compatibility"""
+        return self.GET_morechildren()
 
     @validate(uh = nop('uh'), # VModHash() will raise, check manually
               action = VOneOf('what', ('like', 'dislike', 'save')),
@@ -3559,7 +3567,7 @@ class ApiController(RedditController):
         If `link` is given, return link flair options.
         Otherwise, return user flair options for this subreddit.
 
-        The logged in user's flair is also returned.
+        The signed in user's flair is also returned.
         Subreddit moderators may give a user by `name` to instead
         retrieve that user's flair.
 
@@ -3825,9 +3833,8 @@ class ApiController(RedditController):
 
         return {'names': names}
 
-    @csrf_exempt
-    @validate(link = VByName('link_id', thing_cls = Link))
-    def POST_expando(self, link):
+    @validate(link=VByName('link_id', thing_cls=Link))
+    def GET_expando(self, link):
         if not link:
             abort(404, 'not found')
 
@@ -3843,6 +3850,10 @@ class ApiController(RedditController):
             return websafe(spaceCompress(content))
         else:
             abort(404, 'not found')
+
+    @csrf_exempt
+    def POST_expando(self):
+        return self.GET_expando()
 
     @validatedForm(VUser('password', default=''),
                    VModhash(),
@@ -3972,7 +3983,7 @@ class ApiController(RedditController):
                    about_url=VSanitizedUrl('about_url'),
                    icon_url=VSanitizedUrl('icon_url'),
                    redirect_uri=VRedirectUri('redirect_uri'),
-                   app_type=VOneOf('app_type', ('web', 'installed', 'script')))
+                   app_type=VOneOf('app_type', OAuth2Client.APP_TYPES))
     @api_doc(api_section.apps)
     def POST_updateapp(self, form, jquery, name, about_url, icon_url,
                        redirect_uri, app_type):

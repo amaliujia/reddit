@@ -19,7 +19,7 @@
 # All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
-from pylons import c, response
+from pylons import c, request, response
 from r2.controllers.api_docs import api_doc, api_section
 from r2.controllers.oauth2 import require_oauth2_scope
 from r2.controllers.reddit_base import (
@@ -41,6 +41,7 @@ from r2.lib.validator import (
     VLength,
     VList,
     VValidatedJSON,
+    VUser,
 )
 from r2.models import Account, Trophy
 import r2.lib.errors as errors
@@ -61,8 +62,9 @@ class APIv1UserController(OAuth2ResourceController):
 
     def pre(self):
         OAuth2ResourceController.pre(self)
-        self.authenticate_with_token()
-        self.set_up_user_context()
+	if request.method != "OPTIONS":
+            self.authenticate_with_token()
+            self.set_up_user_context()
         self.run_sitewide_ratelimits()
 
     def try_pagecache(self):
@@ -73,6 +75,9 @@ class APIv1UserController(OAuth2ResourceController):
         abort_with_error(error, error.code or 400)
 
     @require_oauth2_scope("identity")
+    @validate(
+        VUser(),
+    )
     @api_doc(api_section.account)
     def GET_me(self):
         """Returns the identity of the user currently authenticated via OAuth."""
@@ -81,6 +86,7 @@ class APIv1UserController(OAuth2ResourceController):
 
     @require_oauth2_scope("identity")
     @validate(
+        VUser(),
         fields=VList(
             "fields",
             choices=PREFS_JSON_SPEC.spec.keys(),
@@ -114,6 +120,9 @@ class APIv1UserController(OAuth2ResourceController):
         return self._get_usertrophies(user)
 
     @require_oauth2_scope("identity")
+    @validate(
+        VUser(),
+    )
     @api_doc(
         section=api_section.account,
         uri='/api/v1/me/trophies',
@@ -123,6 +132,9 @@ class APIv1UserController(OAuth2ResourceController):
         return self._get_usertrophies(c.oauth_user)
 
     @require_oauth2_scope("mysubreddits")
+    @validate(
+        VUser(),
+    )
     @api_doc(
         section=api_section.account,
         uri='/api/v1/me/karma',
@@ -137,7 +149,10 @@ class APIv1UserController(OAuth2ResourceController):
                                           body=True)
 
     @require_oauth2_scope("account")
-    @validate(validated_prefs=PREFS_JSON_VALIDATOR)
+    @validate(
+        VUser(),
+        validated_prefs=PREFS_JSON_VALIDATOR,
+    )
     @api_doc(api_section.account, json_model=PREFS_JSON_VALIDATOR,
              uri='/api/v1/me/prefs')
     def PATCH_prefs(self, validated_prefs):
@@ -158,6 +173,7 @@ class APIv1UserController(OAuth2ResourceController):
                                            body=True)
     @require_oauth2_scope('subscribe')
     @validate(
+        VUser(),
         friend=VAccountByName('username'),
         notes_json=FRIEND_JSON_VALIDATOR,
     )
@@ -202,6 +218,7 @@ class APIv1UserController(OAuth2ResourceController):
 
     @require_oauth2_scope('mysubreddits')
     @validate(
+        VUser(),
         friend_rel=VFriendOfMine('username'),
     )
     @api_doc(api_section.users, uri='/api/v1/me/friends/{username}')
@@ -212,6 +229,7 @@ class APIv1UserController(OAuth2ResourceController):
 
     @require_oauth2_scope('subscribe')
     @validate(
+        VUser(),
         friend_rel=VFriendOfMine('username'),
     )
     @api_doc(api_section.users, uri='/api/v1/me/friends/{username}')

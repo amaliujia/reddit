@@ -1183,13 +1183,9 @@ class FrontController(RedditController):
         elif vendor == "paypal":
             claim_msg = _("Thanks for buying reddit gold! Your transaction "
                           "has been completed and emailed to you. You can "
-                          "check the details by logging into your account "
+                          "check the details by signing into your account "
                           "at:")
             vendor_url = "https://www.paypal.com/us"
-        elif vendor in {"coinbase", "stripe"}:  # Pending vendors
-            claim_msg = _("thanks for buying reddit gold! your transaction is "
-                          "being processed. if you have any questions please "
-                          "email us at %(gold_email)s")
         elif vendor in {"coinbase", "stripe"}:  # Pending vendors
             claim_msg = _("Thanks for buying reddit gold! Your transaction is "
                           "being processed. If you have any questions please "

@@ -20,13 +20,31 @@
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
-<%namespace file="login.html" import="login_form"/>
+<%namespace name="utils" file="utils.html"/>
 
-%if c.user_is_loggedin:
-  <p class="error">${_("you are signed in. go use the site!")}</p>
-%else:
-  ${login_form(register = True, user = thing.user_reg, dest = thing.dest, compact=True)}
-  <script type="text/javascript">
-    $.request("new_captcha");
-  </script>
-%endif
+<div class="sponsored-page">
+  <form name="lookup-user" action="" method="get">
+    <div class="editor lookup-user">
+      <header>
+        <h2>lookup a user by id</h2>
+      </header>
+      <div class="editor-group">
+        <%utils:line_field title="${_('search')}" css_class="rounded lookup-user-field">
+          <label class="form-group">
+            <div class="label">${_('id')}</div>
+            <input type="text" name="name" value="${thing.user._fullname if thing.user else ""}">
+          </label>
+          <div class='form-group lookup-user-results'>
+            <div class="label">${_('name')}</div>
+            %if thing.user:
+              <strong>${"%s is %s" % (thing.user._fullname, thing.user.name)}</strong>
+            %endif:
+          </div>
+        </%utils:line_field>
+      </div>
+      <footer class="buttons">
+        <button type="submit">search</button>
+      </footer>
+    </form>
+  </div>
+</div>

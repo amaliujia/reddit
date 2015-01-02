@@ -308,8 +308,7 @@ class Reddit(Templated):
         if srbar and not c.cname and not is_api():
             self.srtopbar = SubredditTopBar()
 
-        if (c.user_is_loggedin and self.show_sidebar
-            and not is_api() and not self.show_wiki_actions):
+        if c.user_is_loggedin and not is_api() and not self.show_wiki_actions:
             # insert some form templates for js to use
             # TODO: move these to client side templates
             gold_link = GoldPayment("gift",
@@ -335,8 +334,11 @@ class Reddit(Templated):
                                        thing_type="comment",
                                       )
             report_form = ReportForm()
-            self._content = PaneStack([ShareLink(), content,
-                                       gold_comment, gold_link, report_form])
+
+            panes = [ShareLink(), content, report_form]
+            if self.show_sidebar:
+                panes.extend([gold_comment, gold_link])
+            self._content = PaneStack(panes)
         else:
             self._content = content
 
@@ -1219,9 +1221,12 @@ class LoginPage(BoringPage):
         if c.render_style == "compact":
             title = self.short_title
         else:
-            title = _("login or register")
+            if feature.is_enabled('new_login_flow'):
+                title = _("create account or sign in")
+            else:
+                title = _("login or register")
 
-        BoringPage.__init__(self, "" if feature.is_enabled('new_login_flow') else title, **context)
+        BoringPage.__init__(self, title, **context)
 
         if self.dest:
             u = UrlParser(self.dest)
@@ -1296,7 +1301,8 @@ class RegistrationInfo(Templated):
 
 
 class OAuth2AuthorizationPage(BoringPage):
-    def __init__(self, client, redirect_uri, scope, state, duration):
+    def __init__(self, client, redirect_uri, scope, state, duration,
+                 response_type):
         if duration == "permanent":
             expiration = None
         else:
@@ -1308,7 +1314,9 @@ class OAuth2AuthorizationPage(BoringPage):
                                       scope=scope,
                                       state=state,
                                       duration=duration,
-                                      expiration=expiration)
+                                      expiration=expiration,
+                                      response_type=response_type,
+                                      )
         BoringPage.__init__(self, _("request for permission"),
                             show_sidebar=False, content=content,
                             short_title=_("permission"))
@@ -2310,6 +2318,12 @@ class MultiInfoBar(Templated):
         srs.sort(key=lambda sr: sr.name.lower())
         self.description_md = multi.description_md
         self.srs = srs
+        self.subreddit_selector = SubredditSelector(
+                placeholder=_("add subreddit"),
+                class_name="sr-name",
+                include_user_subscriptions=False,
+                show_add=True,
+            )
 
         explore_sr = g.live_config["listing_chooser_explore_sr"]
         if explore_sr:
@@ -2878,7 +2892,7 @@ class FrameToolbar(Wrapped):
         nonempty = [w for w in wrapped if hasattr(w, "_fullname")]
         Link.add_props(user, nonempty)
         for w in wrapped:
-            w.score_fmt = Score.points
+            w.score_fmt = Score.safepoints
             if not hasattr(w, '_fullname'):
                 w._fullname = None
                 w.tblink = add_sr("/s/"+quote(w.url))
@@ -2949,8 +2963,7 @@ class ShareLink(CachedTemplate):
     def __init__(self, link_name = "", emails = None):
         self.captcha = c.user.needs_captcha()
         self.username = c.user.name
-        Templated.__init__(self, link_name = link_name,
-                           emails = c.user.recent_share_emails())
+        Templated.__init__(self, link_name=link_name)
 
 
 
@@ -3709,6 +3722,7 @@ class PromotePage(Reddit):
                 NavButton('underdelivered', '/sponsor/promoted/underdelivered'),
                 NavButton('house ads', '/sponsor/promoted/house'),
                 NavButton('reported links', '/sponsor/promoted/reported'),
+                NavButton('lookup user', '/sponsor/lookup_user'),
             ]
             return NavMenu(buttons, type='flatlist')
         else:
@@ -3868,20 +3882,7 @@ class PromoteLinkEdit(PromoteLinkBase):
         extra_subreddits = [(_("suggestions:"), top_srs)]
         self.subreddit_selector = SubredditSelector(
             extra_subreddits=extra_subreddits, include_user_subscriptions=False)
-
-        # preload some inventory
-        inv_start = min_start
-        inv_end = min_start + datetime.timedelta(days=14)
-        inv_srs = top_srs + [Frontpage]
-        targets = [Target(sr.name) for sr in inv_srs]
-        sr_inventory = inventory.get_available_pageviews(
-            targets, inv_start, inv_end, datestr=True)
-
-        # LEGACY: sponsored.js uses blank to indicate no targeting, meaning
-        # targeted to the frontpage
-        sr_inventory[''] = sr_inventory[Frontpage.name]
-        del sr_inventory[Frontpage.name]
-        self.inventory = sr_inventory
+        self.inventory = {}
         message = _("This dashboard allows you to easily place ads on reddit. "
                     "Have any questions? [Check out the FAQ](%(faq)s).\n\n"
                     "__New!__ Interest Audience Targeting and user interface changes. "
@@ -3984,6 +3985,11 @@ class Roadblocks(PromoteLinkBase):
 
         self.default_start = startdate.strftime('%m/%d/%Y')
         self.default_end = enddate.strftime('%m/%d/%Y')
+
+
+class SponsorLookupUser(PromoteLinkBase):
+    def __init__(self, user=None):
+        PromoteLinkBase.__init__(self, user=user)
 
 
 class TabbedPane(Templated):
@@ -4715,8 +4721,13 @@ class SubscribeButton(Templated):
 
 class SubredditSelector(Templated):
     def __init__(self, default_sr=None, extra_subreddits=None, required=False,
-                 include_searches=True, include_user_subscriptions=True):
+                 include_searches=True, include_user_subscriptions=True, class_name=None,
+                 placeholder=None, show_add=False):
         Templated.__init__(self)
+
+        self.placeholder = placeholder
+        self.class_name = class_name
+        self.show_add = show_add
 
         if extra_subreddits:
             self.subreddits = extra_subreddits

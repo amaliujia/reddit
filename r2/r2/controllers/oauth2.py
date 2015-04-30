@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -195,7 +195,8 @@ class OAuth2AccessController(MinimalController):
         set_extension(request.environ, "json")
         MinimalController.pre(self)
         require_https()
-        c.oauth2_client = self._get_client_auth()
+        if request.method != "OPTIONS":
+            c.oauth2_client = self._get_client_auth()
 
     def _get_client_auth(self):
         auth = request.headers.get("Authorization")
@@ -210,6 +211,26 @@ class OAuth2AccessController(MinimalController):
             return client
         except RequirementException:
             abort(401, headers=[("WWW-Authenticate", 'Basic realm="reddit"')])
+
+    def OPTIONS_access_token(self):
+        """Send CORS headers for access token requests
+
+        * Allow all origins
+        * Only POST requests allowed to /api/v1/access_token
+        * No ambient credentials
+        * Authorization header required to identify the client
+        * Expose common reddit headers
+
+        """
+        if "Origin" in request.headers:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = \
+                "POST"
+            response.headers["Access-Control-Allow-Headers"] = \
+                    "Authorization, "
+            response.headers["Access-Control-Allow-Credentials"] = "false"
+            response.headers['Access-Control-Expose-Headers'] = \
+                self.COMMON_REDDIT_HEADERS
 
     @validate(
         grant_type=VOneOf("grant_type",
@@ -255,6 +276,7 @@ class OAuth2AccessController(MinimalController):
         more information.
 
         """
+        self.OPTIONS_access_token()
         if grant_type == "authorization_code":
             return self._access_token_code()
         elif grant_type == "refresh_token":
@@ -322,18 +344,21 @@ class OAuth2AccessController(MinimalController):
 
     @validate(refresh_token=VOAuth2RefreshToken("refresh_token"))
     def _access_token_refresh(self, refresh_token):
-        resp = {}
         access_token = None
         if refresh_token:
-            access_token = OAuth2AccessToken._new(
-                refresh_token.client_id, refresh_token.user_id,
-                refresh_token.scope,
-                refresh_token=refresh_token._id)
+            if refresh_token.client_id == c.oauth2_client._id:
+                access_token = OAuth2AccessToken._new(
+                    refresh_token.client_id, refresh_token.user_id,
+                    refresh_token.scope,
+                    refresh_token=refresh_token._id)
+            else:
+                c.errors.add(errors.OAUTH2_INVALID_REFRESH_TOKEN)
         else:
             c.errors.add("NO_TEXT", field="refresh_token")
 
         if c.errors:
             resp = self._check_for_errors()
+            response.status = 400
         else:
             resp = self._make_token_dict(access_token)
         return self.api_wrapper(resp)
@@ -424,6 +449,26 @@ class OAuth2AccessController(MinimalController):
         resp = self._make_token_dict(access_token)
         return self.api_wrapper(resp)
 
+    def OPTIONS_revoke_token(self):
+        """Send CORS headers for token revocation requests
+
+        * Allow all origins
+        * Only POST requests allowed to /api/v1/revoke_token
+        * No ambient credentials
+        * Authorization header required to identify the client
+        * Expose common reddit headers
+
+        """
+        if "Origin" in request.headers:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = \
+                "POST"
+            response.headers["Access-Control-Allow-Headers"] = \
+                    "Authorization, "
+            response.headers["Access-Control-Allow-Credentials"] = "false"
+            response.headers['Access-Control-Expose-Headers'] = \
+                self.COMMON_REDDIT_HEADERS
+
     @validate(
         VRatelimit(rate_user=False, rate_ip=True, prefix="rate_revoke_token_"),
         token_id=nop("token"),
@@ -442,6 +487,7 @@ class OAuth2AccessController(MinimalController):
         See [RFC7009](http://tools.ietf.org/html/rfc7009)
 
         '''
+        self.OPTIONS_revoke_token()
         # In success cases, this endpoint returns no data.
         response.status = 204
 

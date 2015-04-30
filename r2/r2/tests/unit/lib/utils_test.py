@@ -17,7 +17,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -69,6 +69,31 @@ class UtilsTest(unittest.TestCase):
         self.assertEquals(
             utils.extract_subdomain('internet-frontpage.com', 'reddit.com'),
             '')
+
+    def test_coerce_url_to_protocol(self):
+        self.assertEquals(
+            utils.coerce_url_to_protocol('http://example.com/foo'),
+            'http://example.com/foo')
+
+        self.assertEquals(
+            utils.coerce_url_to_protocol('https://example.com/foo'),
+            'http://example.com/foo')
+
+        self.assertEquals(
+            utils.coerce_url_to_protocol('//example.com/foo'),
+            'http://example.com/foo')
+
+        self.assertEquals(
+            utils.coerce_url_to_protocol('http://example.com/foo', 'https'),
+            'https://example.com/foo')
+
+        self.assertEquals(
+            utils.coerce_url_to_protocol('https://example.com/foo', 'https'),
+            'https://example.com/foo')
+
+        self.assertEquals(
+            utils.coerce_url_to_protocol('//example.com/foo', 'https'),
+            'https://example.com/foo')
 
 
 class TestCanonicalizeEmail(unittest.TestCase):

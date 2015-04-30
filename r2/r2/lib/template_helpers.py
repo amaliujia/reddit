@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,7 +24,7 @@ import hmac
 import hashlib
 
 from r2.models import *
-from filters import unsafe, websafe, _force_unicode, _force_utf8
+from filters import unsafe, websafe, _force_utf8, conditional_websafe
 from r2.lib.utils import UrlParser, timeago, timesince, is_subdomain
 
 from r2.lib import hooks
@@ -43,13 +43,12 @@ import time
 from pylons import g, c, request
 from pylons.i18n import _, ungettext
 
-
 static_text_extensions = {
     '.js': 'js',
     '.css': 'css',
     '.less': 'css'
 }
-def static(path):
+def static(path, absolute=False, mangle_name=True):
     """
     Simple static file maintainer which automatically paths and
     versions files being served out of static.
@@ -64,7 +63,11 @@ def static(path):
     should_cache_bust = False
 
     path_components = []
-    actual_filename = None
+    actual_filename = None if mangle_name else filename
+
+    # If building an absolute url, default to https because we like it and the
+    # static server should support it.
+    scheme = 'https' if absolute else None
 
     if g.static_domain:
         domain = g.static_domain
@@ -79,7 +82,7 @@ def static(path):
             should_cache_bust = True
             actual_filename = filename
 
-        domain = None
+        domain = g.domain if absolute else None
 
     path_components.append(dirname)
     if not actual_filename:
@@ -94,7 +97,7 @@ def static(path):
         query = 'v=' + str(file_id)
 
     return urlparse.urlunsplit((
-        None,
+        scheme,
         domain,
         actual_path,
         query,
@@ -127,6 +130,7 @@ def header_url(url):
 
 def js_config(extra_config=None):
     logged = c.user_is_loggedin and c.user.name
+    user_id = c.user_is_loggedin and c.user._id
     gold = bool(logged and c.user.gold)
 
     controller_name = request.environ['pylons.routes_dict']['controller']
@@ -137,6 +141,8 @@ def js_config(extra_config=None):
     config = {
         # is the user logged in?
         "logged": logged,
+        # logged in user's id
+        "user_id": user_id,
         # the subreddit's name (for posts)
         "post_site": c.site.name if not c.default_sr else "",
         # the user's voting hash
@@ -171,12 +177,15 @@ def js_config(extra_config=None):
         "adtracker_url": g.adtracker_url,
         "clicktracker_url": g.clicktracker_url,
         "uitracker_url": g.uitracker_url,
+        "eventtracker_url": g.eventtracker_url,
+        "anon_eventtracker_url": g.anon_eventtracker_url,
         "static_root": static(''),
         "over_18": bool(c.over18),
         "new_window": bool(c.user.pref_newwindow),
         "vote_hash": c.vote_hash,
         "gold": gold,
         "has_subscribed": logged and c.user.has_subscribed,
+        "is_sponsor": logged and c.user_is_sponsor,
         "pageInfo": {
           "verification": verification,
           "actionName": controller_name + '.' + action_name,
@@ -228,19 +237,6 @@ def class_dict():
     res = ', '.join(classes)
     return unsafe('{ %s }' % res)
 
-def calc_time_period(comment_time):
-    # Set in front.py:GET_comments()
-    previous_visits = c.previous_visits
-
-    if not previous_visits:
-        return ""
-
-    rv = ""
-    for i, visit in enumerate(previous_visits):
-        if comment_time > visit:
-            rv = "comment-period-%d" % i
-
-    return rv
 
 def comment_label(num_comments=None):
     if not num_comments:
@@ -317,14 +313,9 @@ def replace_render(listing, item, render_func):
             else:
                 replacements['timesince'] = simplified_timesince(item._date)
 
-            replacements['time_period'] = calc_time_period(item._date)
-
         # compute the last edited time here so we don't end up caching it
         if hasattr(item, "editted") and not isinstance(item.editted, bool):
             replacements['lastedited'] = simplified_timesince(item.editted)
-
-        # Set in front.py:GET_comments()
-        replacements['previous_visits_hex'] = c.previous_visits_hex
 
         renderer = render_func or item.render
         res = renderer(style = style, **replacements)
@@ -445,11 +436,8 @@ def add_sr(
         u.path_add_subreddit(c.site)
 
     if not u.hostname or force_hostname:
-        if c.secure:
-            u.hostname = request.host
-        else:
-            u.hostname = get_domain(cname = (c.cname and not nocname),
-                                    subreddit = False)
+        u.hostname = get_domain(cname = (c.cname and not nocname),
+                                subreddit = False)
 
     if (c.secure and u.is_reddit_url()) or force_https:
         u.scheme = "https"
@@ -625,6 +613,40 @@ def display_comment_karma(karma):
     return karma
 
 
+def format_html(format_string, *args, **kwargs):
+    """
+    Similar to str % foo, but passes all arguments through conditional_websafe,
+    and calls 'unsafe' on the result. This function should be used instead
+    of str.format or % interpolation to build up small HTML fragments.
+
+    Example:
+
+      format_html("Are you %s? %s", name, unsafe(checkbox_html))
+    """
+    if args and kwargs:
+        raise ValueError("Can't specify both positional and keyword args")
+    args_safe = tuple(map(conditional_websafe, args))
+    kwargs_gen = ((k, conditional_websafe(v)) for (k, v) in kwargs.iteritems())
+    kwargs_safe = dict(kwargs_gen)
+
+    format_args = args_safe or kwargs_safe
+    return unsafe(format_string % format_args)
+
+
 def _ws(*args, **kwargs):
     """Helper function to get HTML escaped output from gettext"""
     return websafe(_(*args, **kwargs))
+
+
+def _wsf(format_trans, *args, **kwargs):
+    """
+    format_html, but with an escaped, translated string as the format str
+
+    Sometimes trusted HTML needs to be included in a translatable string,
+    but we don't trust translators to write HTML themselves.
+
+    Example:
+
+      _wsf("Are you %s? %s", name, unsafe(checkbox_html))
+    """
+    return format_html(_ws(format_trans), *args, **kwargs)

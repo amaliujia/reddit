@@ -66,6 +66,8 @@ r.ui.init = function() {
 
     r.ui.initLiveTimestamps()
 
+    r.ui.initNewCommentHighlighting()
+
     r.ui.initTimings()
 }
 
@@ -104,6 +106,40 @@ r.ui.initLiveTimestamps = function() {
           listener.restart()
       })
     }
+}
+
+r.ui.initNewCommentHighlighting = function() {
+  if (!$('body').hasClass('comments-page')) {
+    return;
+  }
+
+  $visitSelector = $('#comment-visits');
+  if ($visitSelector.length === 0) {
+    return;
+  }
+
+  $(document).on('new_things_inserted', r.ui.highlightNewComments);
+  $visitSelector.on('change', r.ui.highlightNewComments);
+  r.ui.highlightNewComments();
+}
+
+r.ui.highlightNewComments = function() {
+  var $comments = $('.comment');
+  var selectedVisitTimestamp = $('#comment-visits').val();
+  var selectedVisit;
+
+  if (selectedVisitTimestamp) {
+    selectedVisit = Date.parse(selectedVisitTimestamp);
+  }
+
+  $comments.each(function() {
+    var $commentEl = $(this);
+    var $timeEl = $commentEl.find('> .entry .tagline time:first-of-type');
+    var commentTime = r.utils.parseTimestamp($timeEl);
+    var shouldHighlight = !!selectedVisit && commentTime > selectedVisit;
+
+    $commentEl.toggleClass('new-comment', shouldHighlight);
+  });
 }
 
 r.ui.initTimings = function() {
@@ -207,7 +243,7 @@ r.ui.Form = function(el) {
     }, this))
 
     this.$el.find('[data-validate-url]')
-        .validator()
+        .validator({ https: !!r.config.https_endpoint })
         .on('initialize.validator', function(e) {
             var $el = $(this);
 
@@ -219,9 +255,13 @@ r.ui.Form = function(el) {
             $(this).stateify('set', 'success');
         })
         .on('invalid.validator', function(e, resp) {
-            var error = r.utils.parseError(resp.errors[0]);
+            // resp may not always be set if client side validation triggered, like
+            // from input type=email
+            if (resp) {
+              var error = r.utils.parseError(resp.errors[0]);
 
-            $(this).stateify('set', 'error', error.message);
+              $(this).stateify('set', 'error', error.message);
+            }
         })
         .on('loading.validator', function(e) {
             $(this).stateify('set', 'loading');

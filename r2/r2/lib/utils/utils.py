@@ -16,39 +16,42 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-import os
 import base64
-import traceback
-import ConfigParser
 import codecs
+import ConfigParser
+import cPickle as pickle
 import itertools
+import math
+import os
+import random
+import re
+import signal
+import traceback
 
-from babel.dates import TIMEDELTA_UNITS
+from collections import OrderedDict
+from copy import deepcopy
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from urllib import unquote_plus
 from urllib2 import urlopen, Request
 from urlparse import urlparse, urlunparse
-import signal
-from copy import deepcopy
-import cPickle as pickle
-import re, math, random
-import boto
-from decimal import Decimal
 
-from BeautifulSoup import BeautifulSoup, SoupStrainer
-
-from datetime import date, datetime, timedelta
-from pylons import c, g, request
-from pylons.i18n import ungettext, _
-from r2.lib.filters import _force_unicode, _force_utf8
-from mako.filters import url_escape
-from r2.lib.contrib import ipaddress
-from r2.lib.require import require, require_split, RequirementException
 import snudown
+import unidecode
 
+from babel.dates import TIMEDELTA_UNITS
+from BeautifulSoup import BeautifulSoup, SoupStrainer
+from mako.filters import url_escape
+from pylons import c, g, request, config
+from pylons.i18n import ungettext, _
+
+from r2.lib.contrib import ipaddress
+from r2.lib.filters import _force_unicode, _force_utf8
+from r2.lib.require import require, require_split, RequirementException
 from r2.lib.utils._utils import *
 
 iters = (list, tuple, set)
@@ -110,6 +113,17 @@ class Enum(Storage):
             return Storage.__contains__(self, item)
 
 
+class class_property(object):
+    """A decorator that combines @classmethod and @property.
+
+    http://stackoverflow.com/a/8198300/120999
+    """
+    def __init__(self, function):
+        self.function = function
+    def __get__(self, instance, cls):
+        return self.function(cls)
+
+
 class Results():
     def __init__(self, sa_ResultProxy, build_fn, do_batch=False):
         self.rp = sa_ResultProxy
@@ -147,30 +161,47 @@ class Results():
         else:
             raise StopIteration
 
+r_base_url = re.compile("(?i)(?:.+?://)?([^#]*[^#/])/?")
+r_domain = re.compile("(?i)(?:.+?://)?([^/:#?]*)")
+r_domain_prefix = re.compile('^www\d*\.')
+
+
 def strip_www(domain):
-    if domain.count('.') >= 2 and domain.startswith("www."):
-        return domain[4:]
-    else:
-        return domain
+    stripped = domain
+    if domain.count('.') > 1:
+        prefix = r_domain_prefix.findall(domain)
+        if domain.startswith("www") and len(prefix):
+            stripped = '.'.join(domain.split('.')[1:])
+    return stripped
+
 
 def is_subdomain(subdomain, base):
     """Check if a domain is equal to or a subdomain of a base domain."""
     return subdomain == base or (subdomain is not None and subdomain.endswith('.' + base))
 
-r_base_url = re.compile("(?i)(?:.+?://)?(?:www[\d]*\.)?([^#]*[^#/])/?")
+
 def base_url(url):
     res = r_base_url.findall(url)
-    return (res and res[0]) or url
+    if res and res[0]:
+        base = strip_www(res[0])
+    else:
+        base = url
+    return base.lower()
 
-r_domain = re.compile("(?i)(?:.+?://)?(?:www[\d]*\.)?([^/:#?]*)")
-def domain(s):
+
+def domain(url):
     """
         Takes a URL and returns the domain part, minus www., if
         present
     """
-    res = r_domain.findall(s)
-    domain = (res and res[0]) or s
+    res = r_domain.findall(url)
+    host = res and res[0]
+    if host:
+        domain = strip_www(host)
+    else:
+        domain = url
     return domain.lower()
+
 
 def extract_subdomain(host=None, base_domain=None):
     """Try to extract a subdomain from the request, as compared to g.domain.
@@ -320,6 +351,9 @@ def sanitize_url(url, require_scheme=False, valid_schemes=VALID_SCHEMES):
     # if there is a scheme and no hostname, it is a bad url.
     if not u.hostname:
         return None
+    # work around CRBUG-464270
+    if len(u.hostname) > 255:
+        return None
     if u.username is not None or u.password is not None:
         return None
 
@@ -392,9 +426,30 @@ def query_string(dict):
     else:
         return ''
 
+
+# Characters that might cause parsing differences in different implementations
+# Spaces only seem to cause parsing differences when occurring directly before
+# the scheme
+URL_PROBLEMATIC_RE = re.compile(
+    ur'(\A\x20|[\x00-\x19\xA0\u1680\u180E\u2000-\u2029\u205f\u3000\\])',
+    re.UNICODE
+)
+
+
+def paranoid_urlparser_method(check):
+    """
+    Decorator for checks on `UrlParser` instances that need to be paranoid
+    """
+    def check_wrapper(parser, *args, **kwargs):
+        return UrlParser.perform_paranoid_check(parser, check, *args, **kwargs)
+
+    return check_wrapper
+
+
 class UrlParser(object):
     """
     Wrapper for urlparse and urlunparse for making changes to urls.
+
     All attributes present on the tuple-like object returned by
     urlparse are present on this class, and are setable, with the
     exception of netloc, which is instead treated via a getter method
@@ -402,18 +457,17 @@ class UrlParser(object):
 
     Unlike urlparse, this class allows the query parameters to be
     converted to a dictionary via the query_dict method (and
-    correspondingly updated vi update_query).  The extension of the
+    correspondingly updated via update_query).  The extension of the
     path can also be set and queried.
 
     The class also contains reddit-specific functions for setting,
     checking, and getting a path's subreddit.  It also can convert
     paths between in-frame and out of frame cname'd forms.
-
     """
 
     __slots__ = ['scheme', 'path', 'params', 'query',
-                 'fragment', 'username', 'password', 'hostname',
-                 'port', '_url_updates', '_orig_url', '_query_dict']
+                 'fragment', 'username', 'password', 'hostname', 'port',
+                 '_orig_url', '_orig_netloc', '_query_dict']
 
     valid_schemes = ('http', 'https', 'ftp', 'mailto')
     cname_get = "cnameframe"
@@ -423,40 +477,77 @@ class UrlParser(object):
         for s in self.__slots__:
             if hasattr(u, s):
                 setattr(self, s, getattr(u, s))
-        self._url_updates = {}
         self._orig_url    = url
+        self._orig_netloc = getattr(u, 'netloc', '')
         self._query_dict  = None
 
+    def __eq__(self, other):
+        """A loose equality method for UrlParsers.
+
+        In particular, this returns true for UrlParsers whose resultant urls
+        have the same query parameters, but in a different order.  These are
+        treated the same most of the time, but if you need strict equality,
+        compare the string results of unparse().
+        """
+        if not isinstance(other, UrlParser):
+            return False
+
+        (s_scheme, s_netloc, s_path, s_params, s_query, s_fragment) = self._unparse()
+        (o_scheme, o_netloc, o_path, o_params, o_query, o_fragment) = other._unparse()
+        # Check all the parsed components for equality, except the query, which
+        # is easier to check in its pure-dictionary form.
+        if (s_scheme != o_scheme or
+                s_netloc != o_netloc or
+                s_path != o_path or
+                s_params != o_params or
+                s_fragment != o_fragment):
+            return False
+        # Coerce query dicts from OrderedDicts to standard dicts to avoid an
+        # order-sensitive comparison.
+        if dict(self.query_dict) != dict(other.query_dict):
+            return False
+
+        return True
+
     def update_query(self, **updates):
-        """
-        Can be used instead of self.query_dict.update() to add/change
-        query params in situations where the original contents are not
-        required.
-        """
-        self._url_updates.update(updates)
+        """Add or change query parameters."""
+        # Since in HTTP everything's a string, coercing values to strings now
+        # makes equality testing easier.  Python will throw an error if you try
+        # to pass in a non-string key, so that's already taken care of for us.
+        updates = {k: str(v) for k, v in updates.iteritems()}
+        self.query_dict.update(updates)
 
     @property
     def query_dict(self):
-        """
-        Parses the `params' attribute of the original urlparse and
-        generates a dictionary where both the keys and values have
-        been url_unescape'd.  Any updates or changes to the resulting
-        dict will be reflected in the updated query params
+        """A dictionary of the current query parameters.
+
+        Keys and values pulled from the original url are un-url-escaped.
+
+        Modifying this function's return value will result in changes to the
+        unparse()-d url, but it's recommended instead to make any changes via
+        `update_query()`.
         """
         if self._query_dict is None:
             def _split(param):
                 p = param.split('=')
                 return (unquote_plus(p[0]),
                         unquote_plus('='.join(p[1:])))
-            self._query_dict = dict(_split(p) for p in self.query.split('&')
-                                    if p)
+            self._query_dict = OrderedDict(
+                                 _split(p) for p in self.query.split('&') if p)
         return self._query_dict
 
     def path_extension(self):
+        """Fetches the current extension of the path.
+
+        If the url does not end in a file or the file has no extension, returns
+        an empty string.
         """
-        Fetches the current extension of the path.
-        """
-        return self.path.split('/')[-1].split('.')[-1]
+        filename = self.path.split('/')[-1]
+        filename_parts = filename.split('.')
+        if len(filename_parts) == 1:
+            return ''
+
+        return filename_parts[-1]
 
     def set_extension(self, extension):
         """
@@ -474,11 +565,39 @@ class UrlParser(object):
         self.path =  '/'.join(dirs)
         return self
 
+    def switch_subdomain_by_extension(self, extension=None):
+        """Change the subdomain to the one that fits an extension.
+
+        This should only be used on reddit URLs.
+
+        Arguments:
+
+        * extension: the template extension to which the middleware hints when
+          parsing the subdomain resulting from this function.
+
+        >>> u = UrlParser('http://www.reddit.com/r/redditdev')
+        >>> u.switch_subdomain_by_extension('compact')
+        >>> u.unparse()
+        'http://i.reddit.com/r/redditdev'
+
+        If `extension` is not provided or does not match any known extensions,
+        the default subdomain (`g.domain_prefix`) will be used.
+
+        Note that this will not remove any existing extensions; if you want to
+        ensure the explicit extension does not override the subdomain hint, you
+        should call `set_extension('')` first.
+        """
+        new_subdomain = g.domain_prefix
+        for subdomain, subdomain_extension in g.extension_subdomains.iteritems():
+            if extension == subdomain_extension:
+                new_subdomain = subdomain
+                break
+        self.hostname = '%s.%s' % (new_subdomain, g.domain)
 
     def unparse(self):
         """
         Converts the url back to a string, applying all updates made
-        to the feilds thereof.
+        to the fields thereof.
 
         Note: if a host name has been added and none was present
         before, will enforce scheme -> "http" unless otherwise
@@ -486,12 +605,10 @@ class UrlParser(object):
         path, and the query string is reconstructed only if the
         query_dict has been modified/updated.
         """
-        # only parse the query params if there is an update dict
-        q = self.query
-        if self._url_updates or self._query_dict is not None:
-            q = self._query_dict or self.query_dict
-            q.update(self._url_updates)
-            q = query_string(q).lstrip('?')
+        return urlunparse(self._unparse())
+
+    def _unparse(self):
+        q = query_string(self.query_dict).lstrip('?')
 
         # make sure the port is not doubly specified
         if getattr(self, 'port', None) and ":" in self.hostname:
@@ -501,9 +618,9 @@ class UrlParser(object):
         if self.netloc and not self.scheme:
             self.scheme = "http"
 
-        return urlunparse((self.scheme, self.netloc,
-                           self.path.replace('//', '/'),
-                           self.params, q, self.fragment))
+        return (self.scheme, self.netloc,
+                self.path.replace('//', '/'),
+                self.params, q, self.fragment)
 
     def path_has_subreddit(self):
         """
@@ -541,7 +658,64 @@ class UrlParser(object):
             pass
         return None
 
-    def is_reddit_url(self, subreddit = None):
+    def perform_paranoid_check(self, check, *args, **kwargs):
+        """
+        Perform a check on a URL that needs to account for bugs in `unparse()`
+
+        If you need to account for quirks in browser URL parsers, you should
+        use this along with `is_web_safe_url()`. Trying to parse URLs like
+        a browser would just makes things really hairy.
+        """
+        variants_to_check = (
+            self,
+            UrlParser(self.unparse())
+        )
+        # If the check doesn't pass on *every* variant, it's a fail.
+        return all(
+            check(variant, *args, **kwargs) for variant in variants_to_check
+        )
+
+    @paranoid_urlparser_method
+    def is_web_safe_url(self):
+        """Determine if this URL could cause issues with different parsers"""
+
+        # There's no valid reason for this, and just serves to confuse UAs.
+        # and urllib2.
+        if self._orig_url.startswith("///"):
+            return False
+
+        # Double-checking the above
+        if not self.hostname and self.path.startswith('//'):
+            return False
+
+        # A host-relative link with a scheme like `https:/baz` or `https:?quux`
+        if self.scheme and not self.hostname:
+            return False
+
+        # Credentials in the netloc? Not on reddit!
+        if "@" in self._orig_netloc:
+            return False
+
+        # `javascript://www.reddit.com/%0D%Aalert(1)` is not safe, obviously
+        if self.scheme and self.scheme.lower() not in self.valid_schemes:
+            return False
+
+        # Reject any URLs that contain characters known to cause parsing
+        # differences between parser implementations
+        for match in re.finditer(URL_PROBLEMATIC_RE, self._orig_url):
+            # XXX: Yuck. We have non-breaking spaces in title slugs! They
+            # should be safe enough to allow after three slashes. Opera 12's the
+            # only browser that trips over them, and it doesn't fall for
+            # `http:///foo.com/`.
+            if match.group(0) == '\xa0':
+                if match.string[0:match.start(0)].count('/') < 3:
+                    return False
+            else:
+                return False
+
+        return True
+
+    def is_reddit_url(self, subreddit=None):
         """utility method for seeing if the url is associated with
         reddit as we don't necessarily want to mangle non-reddit
         domains
@@ -549,22 +723,19 @@ class UrlParser(object):
         returns true only if hostname is nonexistant, a subdomain of
         g.domain, or a subdomain of the provided subreddit's cname.
         """
+
         from pylons import g
-        subdomain = (
+        valid_subdomain = (
             not self.hostname or
             is_subdomain(self.hostname, g.domain) or
             (subreddit and subreddit.domain and
                 is_subdomain(self.hostname, subreddit.domain))
         )
-        # Handle backslash trickery like /\example.com/ being treated as
-        # equal to //example.com/ by some browsers
-        if not self.hostname and not self.scheme and self.path:
-            if self.path.startswith("/\\"):
-                return False
-        if not subdomain or not self.hostname or not g.offsite_subdomains:
-            return subdomain
+
+        if not valid_subdomain or not self.hostname or not g.offsite_subdomains:
+            return valid_subdomain
         return not any(
-            self.hostname.startswith(subdomain + '.')
+            is_subdomain(self.hostname, "%s.%s" % (subdomain, g.domain))
             for subdomain in g.offsite_subdomains
         )
 
@@ -677,6 +848,13 @@ class UrlParser(object):
                            u.path, u.params, u.query, fragment))
 
 
+def coerce_url_to_protocol(url, protocol='http'):
+    '''Given an absolute (but potentially protocol-relative) url, coerce it to
+    a protocol.'''
+    parsed_url = UrlParser(url)
+    parsed_url.scheme = protocol
+    return parsed_url.unparse()
+
 def url_is_embeddable_image(url):
     """The url is on an oembed-friendly domain and looks like an image."""
     parsed_url = UrlParser(url)
@@ -687,6 +865,65 @@ def url_is_embeddable_image(url):
         return True
 
     return False
+
+
+def url_to_thing(url):
+    """Given a reddit URL, return the Thing to which it associates.
+
+    Examples:
+        /r/somesr - Subreddit
+        /r/somesr/comments/j2jx - Link
+        /r/somesr/comments/j2jx/slug/k2js - Comment
+    """
+    from r2.models import Comment, Link, Message, NotFound, Subreddit, Thing
+    from r2.config.middleware import SubredditMiddleware
+    sr_pattern = SubredditMiddleware.sr_pattern
+
+    urlparser = UrlParser(_force_utf8(url))
+    if not urlparser.is_reddit_url():
+        return None
+
+    try:
+        sr_name = sr_pattern.match(urlparser.path).group(1)
+    except AttributeError:
+        sr_name = None
+
+    path = sr_pattern.sub('', urlparser.path)
+    if not path:
+        if not sr_name:
+            return None
+
+        try:
+            return Subreddit._by_name(sr_name, data=True)
+        except NotFound:
+            return None
+
+    # potential TypeError raised here because of environ being None
+    # when calling outside of app context
+    try:
+        route_dict = config['routes.map'].match(path)
+    except TypeError:
+        return None
+
+    if not route_dict:
+        return None
+
+    try:
+        comment = route_dict.get('comment')
+        if comment:
+            return Comment._byID36(comment, data=True)
+
+        article = route_dict.get('article')
+        if article:
+            return Link._byID36(article, data=True)
+
+        msg = route_dict.get('mid')
+        if msg:
+            return Message._byID36(msg, data=True)
+    except (NotFound, ValueError):
+        return None
+
+    return None
 
 
 def pload(fname, default = None):
@@ -941,6 +1178,13 @@ def title_to_url(title, max_length = 50):
             title = title[:last_word]
     return title or "_"
 
+
+def unicode_title_to_ascii(title, max_length=50):
+    title = _force_unicode(title)
+    title = unidecode.unidecode(title)
+    return title_to_url(title, max_length)
+
+
 def dbg(s):
     import sys
     sys.stderr.write('%s\n' % (s,))
@@ -992,7 +1236,7 @@ def url_links_builder(url, exclude=None, num=None, after=None, reverse=None,
     if public_srs_only and not c.user_is_admin:
         subreddits = Subreddit._byID([link.sr_id for link in links], data=True)
         links = [link for link in links
-                 if subreddits[link.sr_id].type != "private"]
+                 if subreddits[link.sr_id].type not in Subreddit.private_types]
 
     links.sort(key=attrgetter('num_comments'), reverse=True)
 
@@ -1035,32 +1279,6 @@ class TimeoutFunction:
             signal.signal(signal.SIGALRM, old)
         return result
 
-def make_offset_date(start_date, interval, future = True,
-                     business_days = False):
-    """
-    Generates a date in the future or past "interval" days from start_date.
-
-    Can optionally give weekends no weight in the calculation if
-    "business_days" is set to true.
-    """
-    if interval is not None:
-        interval = int(interval)
-        if business_days:
-            weeks = interval / 7
-            dow = start_date.weekday()
-            if future:
-                future_dow = (dow + interval) % 7
-                if dow > future_dow or future_dow > 4:
-                    weeks += 1
-            else:
-                future_dow = (dow - interval) % 7
-                if dow < future_dow or future_dow > 4:
-                    weeks += 1
-            interval += 2 * weeks;
-        if future:
-            return start_date + timedelta(interval)
-        return start_date - timedelta(interval)
-    return start_date
 
 def to_date(d):
     if isinstance(d, datetime):
@@ -1289,6 +1507,9 @@ def constant_time_compare(actual, expected):
 
     The time taken is dependent on the number of characters provided
     instead of the number of characters that match.
+
+    When we upgrade to Python 2.7.7 or newer, we should use hmac.compare_digest
+    instead.
     """
     actual_len   = len(actual)
     expected_len = len(expected)
@@ -1412,18 +1633,6 @@ def weighted_lottery(weights, _random=random.random):
         "weighted_lottery messed up: r=%r, t=%r, total=%r" % (r, t, total))
 
 
-def read_static_file_config(config_file):
-    with open(config_file) as f:
-        parser = parse_ini_file(f)
-    config = dict(parser.items("static_files"))
-
-    s3 = boto.connect_s3(config["aws_access_key_id"],
-                         config["aws_secret_access_key"])
-    bucket = s3.get_bucket(config["bucket"])
-
-    return bucket, config
-
-
 class GoldPrice(object):
     """Simple price math / formatting type.
 
@@ -1537,3 +1746,14 @@ def roundrobin(*iterables):
         except StopIteration:
             pending -= 1
             nexts = itertools.cycle(itertools.islice(nexts, pending))
+
+
+def lowercase_keys_recursively(subject):
+    """Return a dict with all keys lowercased (recursively)."""
+    lowercased = dict()
+    for key, val in subject.iteritems():
+        if isinstance(val, dict):
+            val = lowercase_keys_recursively(val)
+        lowercased[key.lower()] = val
+
+    return lowercased

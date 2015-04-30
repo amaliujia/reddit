@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -195,6 +195,9 @@ class ErrorController(RedditController):
 
             if srname:
                 c.site = Subreddit._by_name(srname)
+
+            if request.GET.has_key('allow_framing'):
+                c.allow_framing = bool(request.GET['allow_framing'] == '1')
 
             if code in (204, 304):
                 # NEVER return a content body on 204/304 or downstream

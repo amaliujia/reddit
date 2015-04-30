@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -102,6 +102,8 @@ string_dict = dict(
 
     banned_subreddit_title = _("this subreddit has been banned"),
     banned_subreddit_message = _("most likely this was done automatically by our spam filtering program. the program is still learning, and may even have some bugs, so if you feel the ban was a mistake, please submit a link to our [request a subreddit listing](%(link)s) and be sure to include the **exact name of the subreddit**."),
+    gold_only_subreddit_title = _("this subreddit is for gold members"),
+    gold_only_subreddit_message = _("you must have [reddit gold](/gold/about) to view this super secret subreddit ^[beta](/gold/about#gold-only-subreddits)"),
     private_subreddit_title = _("this subreddit is private"),
     private_subreddit_message = _("the moderators of this subreddit have set it to private. you must be a moderator or approved submitter to view its contents."),
     comments_panel_text = _("""The following is a sample of what Reddit users had to say about this page. The full discussion is available [here](%(fd_link)s); you can also get there by clicking the link's title (in the middle of the toolbar, to the right of the comments button)."""),
@@ -133,8 +135,8 @@ string_dict = dict(
     over_comment_limit_gold = _("Sorry, the maximum number of comments is %d."),
     youve_got_gold = _("%(sender)s just gifted you %(amount)s of reddit gold!"),
     giftgold_note = _("Here's a note that was included:\n\n----\n\n"),
-    youve_been_gilded_comment = _("Another user liked [your comment](%(url)s) so much that they gilded it, giving you reddit gold.\n\n"),
-    youve_been_gilded_link = _("Another user liked [your submission](%(url)s) so much that they gilded it, giving you reddit gold.\n\n"),
+    youve_been_gilded_comment = _("%(sender)s liked [your comment](%(url)s) so much that they gilded it, giving you reddit gold.\n\n"),
+    youve_been_gilded_link = _("%(sender)s liked [your submission](%(url)s) so much that they gilded it, giving you reddit gold.\n\n"),
     respond_to_anonymous_gilder = _("Want to say thanks to your mysterious benefactor? Reply to this message. You will find out their username if they choose to reply back."),
     unsupported_respond_to_gilder = _("Sorry, replying directly to your mysterious benefactor is not yet supported for this gilding."),
     anonymous_gilder_warning = _("***WARNING: Responding to this message will reveal your username to the gildee.***\n\n"),

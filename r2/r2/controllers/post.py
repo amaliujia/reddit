@@ -16,13 +16,15 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 from r2.lib.pages import *
 from reddit_base import (
     hsts_eligible,
     hsts_modify_redirect,
+    set_over18_cookie,
+    delete_over18_cookie,
 )
 from api import ApiController
 from r2.lib.errors import BadRequestError, errors
@@ -57,13 +59,20 @@ class PostController(ApiController):
               all_langs=VOneOf('all-langs', ('all', 'some'), default='all'),
               **PREFS_VALIDATORS)
     def POST_options(self, all_langs, **prefs):
+        u = UrlParser(c.site.path + "prefs")
+
         filter_prefs(prefs, c.user)
         if c.errors.errors:
-            return abort(BadRequestError(errors.INVALID_PREF))
+            for error in c.errors.errors:
+                if error[1] == 'stylesheet_override':
+                    u.update_query(error_style_override=error[0])
+                else:
+                    u.update_query(generic_error=error[0])
+            return self.redirect(u.unparse())
+
         set_prefs(c.user, prefs)
         c.user._commit()
-        u = UrlParser(c.site.path + "prefs")
-        u.update_query(done = 'true')
+        u.update_query(done='true')
         if c.cname:
             u.put_in_frame()
         return self.redirect(u.unparse())
@@ -81,11 +90,15 @@ class PostController(ApiController):
                 c.user.pref_over_18 = True
                 c.user._commit()
             else:
-                c.cookies.add("over18", "1")
+                set_over18_cookie()
             return self.redirect(dest)
         else:
+            if c.user_is_loggedin and not c.errors:
+                c.user.pref_over_18 = False
+                c.user._commit()
+            else:
+                delete_over18_cookie()
             return self.redirect('/')
-
 
     @csrf_exempt
     @validate(msg_hash = nop('x'))
@@ -121,9 +134,7 @@ class PostController(ApiController):
             return LoginPage(user_login = request.POST.get('user'),
                              dest = dest).render()
 
-        if hsts_eligible():
-            dest = hsts_modify_redirect(dest)
-        return self.redirect(dest)
+        return self.hsts_redirect(dest)
 
     @csrf_exempt
     @validate(dest = VDestination(default = "/"))
@@ -136,9 +147,7 @@ class PostController(ApiController):
             return LoginPage(user_reg = request.POST.get('user'),
                              dest = dest).render()
 
-        if hsts_eligible():
-            dest = hsts_modify_redirect(dest)
-        return self.redirect(dest)
+        return self.hsts_redirect(dest)
 
     def GET_login(self, *a, **kw):
         return self.redirect('/login' + query_string(dict(dest="/")))

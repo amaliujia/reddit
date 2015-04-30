@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2014
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -28,7 +28,7 @@
    from r2.lib.utils import long_datetime
 %>
 
-<%namespace file="utils.html" import="plain_link" />
+<%namespace file="utils.html" import="classes, plain_link" />
 
 ${self.RenderPrintable()}
 
@@ -132,6 +132,14 @@ ${self.RenderPrintable()}
     % if hasattr(what, 'adserver_click_url'):
       data-adserver-click-url="${what.adserver_click_url}"
     % endif
+
+    % if hasattr(what, 'third_party_tracking_url'):
+      data-third-party-tracking-url="${what.third_party_tracking_url}"
+    % endif
+
+    % if hasattr(what, 'third_party_tracking_url_2'):
+      data-third-party-tracking-two-url="${what.third_party_tracking_url_2}"
+    % endif
 </%def>
 
 <%def name="RenderPrintable()">
@@ -190,17 +198,20 @@ ${self.RenderPrintable()}
 
 <%def name="Child(display=True)">
 <div class="child" ${(not display and "style='display:none'" or "")}>
-  ${thing.childlisting}
+  %if thing.childlisting:
+    ${thing.childlisting}
+  %endif
 </div>
 </%def>
 
 <%def name="arrow(this, dir, mod)">
 <% 
-   _type = "up" if dir > 0 else "down"
-   _class = _type + ("mod" if mod else "")
-   fullname = this._fullname
+   arrow_type = "up" if dir > 0 else "down"
+   arrow_class = arrow_type + ("mod" if mod else "")
+   login_class = "login-required" if not g.read_only_mode else ""
 %>
-  <div class="arrow ${_class} login-required"
+  <div ${classes("arrow", arrow_class, login_class)}
+    %if not g.read_only_mode:
        %if getattr(thing, "votable", True):
          onclick="$(this).vote(r.config.vote_hash, null, event)"
        %else:
@@ -213,16 +224,13 @@ ${self.RenderPrintable()}
        aria-label="${_("downvote")}"
        % endif
        tabindex="0"
-       >
+    %endif
+    >
   </div>
 </%def>
 
-<%def name="score(this, likes=None, scores = None, tag='span')" >
-  <%
-     if scores is None:
-        scores = this.display_score
-   %>
-  %for cls, score in zip(["dislikes", "unvoted", "likes"], scores):
+<%def name="score(thing, tag='span')" >
+  %for cls, score in zip(["dislikes", "unvoted", "likes"], thing.display_score):
     <${tag} class="score ${cls}">
       ${score}
     </${tag}>

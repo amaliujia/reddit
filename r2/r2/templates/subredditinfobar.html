@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2014
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -62,6 +62,18 @@
                format_arg='leave',
                hidden_data=dict(
                  id=thing.sr._fullname))}
+  %endif
+
+  %if thing.sr_style_toggle:
+    <form class="toggle sr_style_toggle">
+      <input id="sr_style_enabled" type="checkbox" name="sr_style_enabled"
+        ${'checked="checked"' if thing.use_subreddit_style else ""}
+      >
+      <label for="sr_style_enabled">
+        ${_("Show this subreddit's theme")}
+      </label>
+      <div id="sr_style_throbber" class="throbber"></div>
+    </form>
   %endif
 
   %if thing.flair_prefs:

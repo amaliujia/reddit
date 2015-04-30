@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -44,6 +44,7 @@ from r2.lib.validator import (
     textresponse,
     validatedForm,
     VByName,
+    VDecimal,
     VFloat,
     VInt,
     VLength,
@@ -56,17 +57,18 @@ from r2.models import (
     Account,
     account_by_payingid,
     account_from_stripe_customer_id,
-    accountid_from_paypalsubscription,
+    accountid_from_subscription,
     admintools,
     append_random_bottlecap_phrase,
     cancel_subscription,
     Comment,
     creddits_lock,
-    Email,
     create_claimed_gold,
     create_gift_gold,
     create_gold_code,
+    Email,
     get_discounted_price,
+    has_prev_subscr_payments,
     Link,
     make_gold_message,
     NotFound,
@@ -77,13 +79,15 @@ from r2.models import (
     generate_token,
 )
 
+BLOB_TTL = 86400 * 30
 stripe.api_key = g.secrets['stripe_secret_key']
+
 
 def generate_blob(data):
     passthrough = generate_token(15)
 
     g.hardcache.set("payment_blob-" + passthrough,
-                    data, 86400 * 30)
+                    data, BLOB_TTL)
     g.log.info("just set payment_blob-%s", passthrough)
     return passthrough
 
@@ -98,8 +102,22 @@ def get_blob(code):
             raise ValueError("payment_blob %s has status = %s" %
                              (code, blob.get('status', None)))
         blob['status'] = "locked"
-        g.hardcache.set(key, blob, 86400 * 30)
+        g.hardcache.set(key, blob, BLOB_TTL)
     return key, blob
+
+
+def update_blob(code, updates=None):
+    blob = g.hardcache.get("payment_blob-%s" % code)
+    if not blob:
+        raise NotFound("No payment_blob-" + code)
+    if blob.get('account_id', None) != c.user._id:
+        raise ValueError("%s doesn't have access to payment_blob %s" %
+                         (c.user._id, code))
+
+    for item, value in updates.iteritems():
+        blob[item] = value
+    g.hardcache.set("payment_blob-%s" % code, blob, BLOB_TTL)
+
 
 def has_blob(custom):
     if not custom:
@@ -185,7 +203,7 @@ def existing_subscription(subscr_id, paying_id, custom):
     if subscr_id is None:
         return None
 
-    account_id = accountid_from_paypalsubscription(subscr_id)
+    account_id = accountid_from_subscription(subscr_id)
 
     if not account_id and has_blob(custom):
         # New subscription contains the user info in hardcache
@@ -271,17 +289,20 @@ def send_gift(buyer, recipient, months, days, signed, giftmessage,
     if not thing:
         subject = _('Let there be gold! %s just sent you reddit gold!') % sender
         message = strings.youve_got_gold % dict(sender=md_sender, amount=amount)
-
-        if giftmessage and giftmessage.strip():
-            message += "\n\n" + strings.giftgold_note + giftmessage + '\n\n----'
     else:
         url = thing.make_permalink_slow()
         if isinstance(thing, Comment):
             subject = _('Your comment has been gilded!')
-            message = strings.youve_been_gilded_comment % {'url': url}
+            message = strings.youve_been_gilded_comment 
+            message %= {'sender': md_sender, 'url': url}
         else:
             subject = _('Your submission has been gilded!')
-            message = strings.youve_been_gilded_link % {'url': url}
+            message = strings.youve_been_gilded_link 
+            message %= {'sender': md_sender, 'url': url}
+
+    if giftmessage and giftmessage.strip():
+        message += ("\n\n" + strings.giftgold_note + 
+                    _force_unicode(giftmessage) + '\n\n----')
 
     message += '\n\n' + strings.gold_benefits_msg
     if g.lounge_reddit:
@@ -406,7 +427,7 @@ class IpnController(RedditController):
                 except MessageError:
                     msg = _("there was an error creating a gift code. "
                             "please try again later, or contact %(email)s "
-                            "for assistance.") % {'email': g.goldthanks_email}
+                            "for assistance.") % {'email': g.goldsupport_email}
                     form.set_text(".status", msg)
                     return
                 form.set_text(".status",
@@ -424,7 +445,7 @@ class IpnController(RedditController):
         form.find("button").hide()
 
         payment_blob["status"] = "processed"
-        g.hardcache.set(blob_key, payment_blob, 86400 * 30)
+        g.hardcache.set(blob_key, payment_blob, BLOB_TTL)
 
         if thing:
             gilding_message = make_gold_message(thing, user_gilded=True)
@@ -439,7 +460,7 @@ class IpnController(RedditController):
                   paying_id = VPrintable('payer_id', 50),
                   payer_email = VPrintable('payer_email', 250),
                   mc_currency = VPrintable('mc_currency', 20),
-                  mc_gross = VFloat('mc_gross'),
+                  mc_gross = VDecimal('mc_gross'),
                   custom = VPrintable('custom', 50))
     def POST_ipn(self, paypal_secret, payment_status, txn_id, paying_id,
                  payer_email, mc_currency, mc_gross, custom):
@@ -626,7 +647,7 @@ class IpnController(RedditController):
                 g.log.error('finish: could not send system message')
 
         payment_blob["status"] = "processed"
-        g.hardcache.set(blob_key, payment_blob, 86400 * 30)
+        g.hardcache.set(blob_key, payment_blob, BLOB_TTL)
 
 
 class Webhook(object):
@@ -719,7 +740,7 @@ class GoldPaymentController(RedditController):
             subject = _('reddit gold payment cancelled')
             msg = _('Your reddit gold payment has been cancelled, contact '
                     '%(gold_email)s for details') % {'gold_email':
-                                                     g.goldthanks_email}
+                                                     g.goldsupport_email}
             if existing:
                 # note that we don't check status on existing, probably
                 # should update gold_table when a cancellation happens
@@ -735,7 +756,7 @@ class GoldPaymentController(RedditController):
             subject = _('reddit gold payment failed')
             msg = _('Your reddit gold payment has failed, contact '
                     '%(gold_email)s for details') % {'gold_email':
-                                                     g.goldthanks_email}
+                                                     g.goldsupport_email}
         elif event_type == 'deleted_subscription':
             # the subscription may have been deleted directly by the user using
             # POST_delete_subscription, in which case gold_subscr_id is already
@@ -745,7 +766,7 @@ class GoldPaymentController(RedditController):
                 msg = _('Your reddit gold subscription has been cancelled '
                         'because your credit card could not be charged. '
                         'Contact %(gold_email)s for details')
-                msg %= {'gold_email': g.goldthanks_email}
+                msg %= {'gold_email': g.goldsupport_email}
                 webhook.buyer.gold_subscr_id = None
                 webhook.buyer._commit()
         elif event_type == 'refunded':
@@ -755,7 +776,7 @@ class GoldPaymentController(RedditController):
             subject = _('reddit gold refund')
             msg = _('Your reddit gold payment has been refunded, contact '
                    '%(gold_email)s for details') % {'gold_email':
-                                                    g.goldthanks_email}
+                                                    g.goldsupport_email}
             reverse_gold_purchase(webhook.transaction_id)
 
         if msg:
@@ -808,6 +829,12 @@ class GoldPaymentController(RedditController):
         with gold_lock(gold_recipient):
             gold_recipient._sync_latest()
 
+            secret_pieces = [goldtype]
+            if goldtype == 'gift':
+                secret_pieces.append(recipient.name)
+            secret_pieces.append(secret or transaction_id)
+            secret = '-'.join(secret_pieces)
+
             if goldtype in ('onetime', 'autorenew'):
                 admintools.adjust_gold_expiration(buyer, days=days)
                 if goldtype == 'onetime':
@@ -821,6 +848,9 @@ class GoldPaymentController(RedditController):
                     message = ("see the details of your subscription on "
                                "[your userpage](/u/%s)" % buyer.name)
 
+                    if has_prev_subscr_payments(subscr_id):
+                        secret = None
+
             elif goldtype == 'creddits':
                 buyer._incr('gold_creddits', months)
                 subject = "thanks for buying creddits!"
@@ -833,18 +863,11 @@ class GoldPaymentController(RedditController):
                 subject = "thanks for giving reddit gold!"
                 message = "Your gift to %s has been delivered." % recipient.name
 
-            status = 'processed'
-            secret_pieces = [goldtype]
-            if goldtype == 'gift':
-                secret_pieces.append(recipient.name)
-            secret_pieces.append(secret or transaction_id)
-            secret = '-'.join(secret_pieces)
-
             try:
                 create_claimed_gold(transaction_id, payer_email, payer_id,
                                     pennies, days, secret, buyer._id,
                                     c.start_time, subscr_id=subscr_id,
-                                    status=status)
+                                    status='processed')
             except IntegrityError:
                 g.log.error('gold: got duplicate gold transaction')
 
@@ -889,8 +912,10 @@ class StripeController(GoldPaymentController):
         'charge.dispute.updated': 'noop',
         'charge.dispute.closed': 'noop',
         'charge.dispute.funds_withdrawn': 'noop',
+        'charge.updated': 'noop',
         'customer.created': 'noop',
         'customer.card.created': 'noop',
+        'customer.card.updated': 'noop',
         'customer.card.deleted': 'noop',
         'transfer.created': 'noop',
         'transfer.paid': 'noop',
@@ -930,8 +955,7 @@ class StripeController(GoldPaymentController):
                 # to cancel the charge
                 g.log.error('no account for stripe invoice: %s', invoice)
                 try:
-                    customer = stripe.Customer.retrieve(customer_id)
-                    customer.delete()
+                    cancel_stripe_subscription(customer_id)
                 except stripe.InvalidRequestError:
                     pass
         elif status == 'customer.subscription.deleted':
@@ -1052,14 +1076,13 @@ class StripeController(GoldPaymentController):
         if not user.has_stripe_subscription:
             return
 
-        customer = stripe.Customer.retrieve(user.gold_subscr_id)
-        customer.delete()
+        customer = cancel_stripe_subscription(user.gold_subscr_id)
 
         user.gold_subscr_id = None
         user._commit()
         subject = _('your gold subscription has been cancelled')
         message = _('if you have any questions please email %(email)s')
-        message %= {'email': g.goldthanks_email}
+        message %= {'email': g.goldsupport_email}
         send_system_message(user, subject, message)
         return customer
 
@@ -1170,12 +1193,18 @@ class CoinbaseController(GoldPaymentController):
         'cancelled': 'cancelled',
         'mispaid': 'noop',
         'expired': 'noop',
+        'payout': 'noop',
     }
     abort_on_error = False
 
     @classmethod
     def process_response(cls):
         event_dict = json.loads(request.body)
+
+        # handle non-payment events we can ignore
+        if 'payout' in event_dict:
+            return 'payout', None
+
         order = event_dict['order']
         transaction_id = 'C%s' % order['id']
         status = order['status']    # new/completed/cancelled
@@ -1329,13 +1358,17 @@ def reverse_gold_purchase(transaction_id):
     days = transaction.days
     months = days / 31
 
-    secret = transaction.secret
-    if '{' in secret:
-        secret.strip('{}') # I goofed
-        pieces = secret.split(',')
+    if transaction.subscr_id:
+        goldtype = 'autorenew'
     else:
-        pieces = secret.split('-')
-    goldtype = pieces[0]
+        secret = transaction.secret
+        if '{' in secret:
+            secret.strip('{}') # I goofed
+            pieces = secret.split(',')
+        else:
+            pieces = secret.split('-')
+        goldtype = pieces[0]
+
     if goldtype == 'gift':
         recipient_name, secret = pieces[1:]
         recipient = Account._by_name(recipient_name)
@@ -1356,3 +1389,11 @@ def reverse_gold_purchase(transaction_id):
             message = 'sorry, but the payment was reversed'
             send_system_message(recipient, subject, message)
     update_gold_transaction(transaction_id, 'reversed')
+
+
+def cancel_stripe_subscription(customer_id):
+    customer = stripe.Customer.retrieve(customer_id)
+    if hasattr(customer, 'deleted'):
+        return customer
+    customer.delete()
+    return customer

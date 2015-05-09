@@ -19,6 +19,7 @@
 # All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
+import json
 
 from r2.models import Account, Link, Comment, Report, LinksByAccount
 from r2.models.vote import cast_vote, get_votes, VotesByAccount
@@ -546,10 +547,7 @@ def get_user_actions(user, sort, time):
                 results.append(thing + (action_type,))
                 unique_ids.add(thing[0])
 
-    comparator = ThingTupleComparator(actions_by_type[0][0])
-    results.sort(cmp=comparator)
-
-    return results
+    return sorted(results, key=lambda x: x[1], reverse=True)
 
 
 def get_overview(user, sort, time):
@@ -1682,8 +1680,8 @@ vote_fastlane_q = 'vote_fastlane_q'
 vote_names_by_dir = {True: "1", None: "0", False: "-1"}
 vote_dirs_by_name = {v: k for k, v in vote_names_by_dir.iteritems()}
 
-def queue_vote(user, thing, dir, ip, vote_info=None,
-               cheater = False, store = True):
+def queue_vote(user, thing, dir, ip, vote_info=None, cheater=False, store=True,
+               event_data=None):
     # set the vote in memcached so the UI gets updated immediately
     key = prequeued_vote_key(user, thing)
     grace_period = int(g.vote_queue_grace_period.total_seconds())
@@ -1714,9 +1712,16 @@ def queue_vote(user, thing, dir, ip, vote_info=None,
                         user, thing)
             return
 
-        amqp.add_item(qname,
-                      pickle.dumps((user._id, thing._fullname,
-                                    dir, ip, vote_info, cheater)))
+        vote = {
+            "uid": user._id,
+            "tid": thing._fullname,
+            "dir": dir,
+            "ip": ip,
+            "info": vote_info,
+            "cheater": cheater,
+            "event": event_data,
+        }
+        amqp.add_item(qname, json.dumps(vote))
 
 def prequeued_vote_key(user, item):
     return 'registered_vote_%s_%s' % (user._id, item._fullname)
@@ -1790,16 +1795,15 @@ def get_likes(user, requested_items):
 
     return res
 
-def handle_vote(user, thing, dir, ip, vote_info,
-                cheater=False, foreground=False, timer=None, date=None):
+
+def handle_vote(user, thing, vote, foreground=False, timer=None, date=None):
     if timer is None:
         timer = SimpleSillyStub()
 
     from r2.lib.db import tdb_sql
     from sqlalchemy.exc import IntegrityError
     try:
-        v = cast_vote(user, thing, dir, ip, vote_info=vote_info,
-                      cheater=cheater, timer=timer, date=date)
+        v = cast_vote(user, thing, vote, timer=timer, date=date)
     except (tdb_sql.CreationError, IntegrityError):
         g.log.error("duplicate vote for: %s" % str((user, thing, dir)))
         return
@@ -1852,12 +1856,10 @@ def process_votes(qname, limit=0):
         timer = stats.get_timer("service_time." + stats_qname)
         timer.start()
 
-        #assert(len(msgs) == 1)
-        r = pickle.loads(msg.body)
+        vote = json.loads(msg.body)
 
-        uid, tid, dir, ip, vote_info, cheater = r
-        voter = Account._byID(uid, data=True)
-        votee = Thing._by_fullname(tid, data = True)
+        voter = Account._byID(vote["uid"], data=True)
+        votee = Thing._by_fullname(vote["tid"], data=True)
         timer.intermediate("preamble")
 
         # Convert the naive timestamp we got from amqplib to a
@@ -1868,9 +1870,9 @@ def process_votes(qname, limit=0):
         # I don't know how, but somebody is sneaking in votes
         # for subreddits
         if isinstance(votee, (Link, Comment)):
-            print (voter, votee, dir, ip, vote_info, cheater)
-            handle_vote(voter, votee, dir, ip, vote_info,
-                        cheater = cheater, foreground=True, timer=timer,
+            print (voter, votee, vote["dir"], vote["ip"], vote["info"],
+                   vote["cheater"])
+            handle_vote(voter, votee, vote, foreground=True, timer=timer,
                         date=date)
 
         if isinstance(votee, Comment):
@@ -1878,7 +1880,7 @@ def process_votes(qname, limit=0):
             timer.intermediate("update_comment_votes")
 
         stats.simple_event('vote.total')
-        if cheater:
+        if vote["cheater"]:
             stats.simple_event('vote.cheater')
         timer.flush()
 

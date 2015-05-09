@@ -1414,7 +1414,7 @@ class SearchPage(BoringPage):
         self.subreddits = subreddits
 
         # generate the over18 redirect url for the current search if needed
-        if not c.over18 and feature.is_enabled('safe_search'):
+        if kw['nav_menus'] and not c.over18 and feature.is_enabled('safe_search'):
             u = UrlParser(add_sr('/search'))
             if prev_search:
                 u.update_query(q=prev_search)
@@ -2205,6 +2205,14 @@ class ProfileBar(Templated):
                                 user.gold_creddits)
                 msg = msg % dict(creddits=user.gold_creddits)
                 self.gold_creddit_message = msg
+
+            if user.num_gildings > 0 and self.show_private_info:
+                gildings_msg = ungettext(
+                    "%(gildings)s gilding given out",
+                    "%(gildings)s gildings given out",
+                    user.num_gildings)
+                gildings_msg = gildings_msg % dict(gildings=user.num_gildings)
+                self.num_gildings_message = gildings_msg
 
             if not self.viewing_self:
                 self.goldlink = "/gold?goldtype=gift&recipient=" + user.name

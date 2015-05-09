@@ -64,6 +64,7 @@ class Account(Thing):
                                                'inbox_count',
                                                'num_payment_methods',
                                                'num_failed_payments',
+                                               'num_gildings',
                                               )
     _int_prop_suffix = '_karma'
     _essentials = ('name', )
@@ -109,6 +110,7 @@ class Account(Thing):
                      pref_collapse_left_bar=False,
                      pref_public_server_seconds=False,
                      pref_ignore_suggested_sort=False,
+                     pref_beta=False,
                      mobile_compress = False,
                      mobile_thumbnail = True,
                      reported = 0,
@@ -127,6 +129,7 @@ class Account(Thing):
                      gold = False,
                      gold_charter = False,
                      gold_creddits = 0,
+                     num_gildings=0,
                      cake_expiration=None,
                      otp_secret=None,
                      state=0,

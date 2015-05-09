@@ -979,7 +979,7 @@ class FrontController(RedditController):
         else:
             site = c.site
 
-        has_query = query or not isinstance(site, DefaultSR)
+        has_query = query or not isinstance(site, (DefaultSR, AllSR))
 
         if not syntax:
             syntax = SearchQuery.default_syntax
@@ -1000,19 +1000,29 @@ class FrontController(RedditController):
         else:
             faceting = None
 
-        result_type = request.GET.get('type')
-        sr_num = 0
+        # specify link or subreddit result types (when supported)
+        result_types = set(request.GET.getall('type'))
+        if is_api():
+            result_types = result_types or {'link'}
+        elif feature.is_enabled('subreddit_search'):
+            result_types = result_types or {'link', 'sr'}
+        else:
+            result_types = {'link'}
 
-        # combined results on first page only, html site only
-        if c.render_style == 'html' and feature.is_enabled('subreddit_search'):
-            if after is None and not restrict_sr and not result_type:
-                # hardcoded to 5 subreddits (or fewer)
-                sr_num = min(5, int(num / 5))
-                num = num - sr_num
-            elif result_type == 'sr':
-                sr_num = num
-                num = 0
-                restrict_sr = False
+        # no subreddit results if fielded search or structured syntax
+        if syntax == 'cloudsearch' or (query and ':' in query):
+            result_types = result_types - {'sr'}
+
+        # combined results on first page only
+        if not after and not restrict_sr and result_types == {'link', 'sr'}:
+            # hardcoded to 5 subreddits (or fewer)
+            sr_num = min(5, int(num / 5))
+            num = num - sr_num
+        elif result_types == {'sr'}:
+            sr_num = num
+            num = 0
+        else:
+            sr_num = 0
 
         content = None
         subreddits = None
@@ -1063,7 +1073,7 @@ class FrontController(RedditController):
 
         # extra search request for subreddit results
         if sr_num > 0 and has_query:
-            sr_q = SubredditSearchQuery(query, sort='relevance', faceting={},
+            sr_q = SubredditSearchQuery(query, sort='rel1', faceting={},
                                         include_over18=include_over18)
             subreddits = self._search(sr_q, num=sr_num, reverse=reverse,
                                       after=after, count=count, type='sr',

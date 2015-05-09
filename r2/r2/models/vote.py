@@ -231,7 +231,7 @@ class VoterIPByThing(tdb_cassandra.View):
         cls._set_values(votee_fullname, {voter_id36: ip})
 
 
-def cast_vote(sub, obj, dir, ip, vote_info, cheater, timer, date):
+def cast_vote(sub, obj, vote_info, timer, date):
     from r2.models.admintools import valid_user, valid_thing, update_score
     from r2.lib.count import incr_sr_count
 
@@ -242,11 +242,11 @@ def cast_vote(sub, obj, dir, ip, vote_info, cheater, timer, date):
     vote = Storage(
         _thing1=sub,
         _thing2=obj,
-        _name=names_by_dir[dir],
+        _name=names_by_dir[vote_info["dir"]],
         _date=date,
         valid_thing=True,
         valid_user=True,
-        ip=ip,
+        ip=vote_info["ip"],
     )
 
     # these track how much ups/downs should change on `obj`
@@ -282,7 +282,8 @@ def cast_vote(sub, obj, dir, ip, vote_info, cheater, timer, date):
     karma = sub.karma(kind, sr)
 
     if vote.valid_thing:
-        vote.valid_thing = valid_thing(vote, karma, cheater, vote_info)
+        vote.valid_thing = valid_thing(vote, karma, vote_info["cheater"],
+                                       vote_info["info"])
 
     if vote.valid_user:
         vote.valid_user = vote.valid_thing and valid_user(vote, sr, karma)
@@ -313,11 +314,14 @@ def cast_vote(sub, obj, dir, ip, vote_info, cheater, timer, date):
             timer.intermediate("incr_sr_counts")
 
     # write the vote to cassandra
-    VotesByAccount.copy_from(vote, vote_info)
+    VotesByAccount.copy_from(vote, vote_info["info"])
     timer.intermediate("cassavotes")
 
     vote._thing2.update_search_index(boost_only=True)
     timer.intermediate("update_search_index")
+
+    if "event" in vote_info and vote_info["event"]:
+        g.events.vote_event(vote, old_vote, event_base=vote_info["event"])
 
     return vote
 
